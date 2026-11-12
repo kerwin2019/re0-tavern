@@ -1,5 +1,11 @@
 # -*- coding: utf-8 -*-
 """
+v4.4.9（1113 晨·重画令牌，用户醒后令「对图不满意想重新生成/演示要新鲜图」）：新增「重画日记」口
+（_diary_redraw_hit：「重画日记」「日记 重画」等去首尾+内部空格（全半角）后恰为四字才命中，精确制
+同「日记」口），命中= _comic_payload(force=True)：跳过当日幂等重新 文案→入队→覆盖 comic_state
+（此后打「日记」秒回的就是新图）；prompt 尾附「换不同取材角度避免与上一版雷同」；队列 item 带
+seed_base=时间派生（comic_diary 默认种子=日期基数，同日重画不换种子=构图雷同「重画了个寂寞」），
+PC 轮询器透传 --seed-base。旧图不删照在墙上。「日记」口与幂等语义零变化。
 v4.4.8（1113 深夜·日记令牌改接四格漫画线，用户语义裁决「日记=四格漫画+评分那套，不是睡前插画」）：
 触发口原样（_diary_token_hit 只认「日记」二字），但命中后改走 _comic_payload()：当天聊天(_today_msgs)
 →文案员提示词（四格漫画线-定档-20261015 正本移植）→GLM(max_tokens 2048, effort low)→容错 JSON 解析
@@ -1140,20 +1146,24 @@ def _comic_json_parse(raw):
     return j
 
 
-def _comic_payload():
-    """v4.4.8 四格漫画当日幂等：已生成直接回；否则 当天聊天→文案员 GLM→台词 JSON→入队→落 state。
+def _comic_payload(force=False):
+    """v4.4.8/9 四格漫画当日幂等：已生成且非 force 直接回；否则 当天聊天→文案员 GLM→台词 JSON→入队→落 state。
+    force=True（重画令牌）：跳过当日缓存重新生成，prompt 附换角度句，入队带时间派生 seed_base（防同种子构图雷同）。
     返回 {"ok":True,"duplicate":…,"date":…,"gid":…,"payload":<台词 JSON 字符串>} 或 {"ok":False,"error":…}。"""
     today_s = datetime.now(CN_TZ).strftime("%Y-%m-%d")
     st = _comic_read()
-    if st.get("date") == today_s and st.get("gid"):
+    if not force and st.get("date") == today_s and st.get("gid"):
         return {"ok": True, "duplicate": True, "date": today_s, "gid": st.get("gid", ""),
                 "payload": st.get("payload", "")}
+    _prev_same_day = bool(force and st.get("date") == today_s and st.get("payload"))
     rows = _today_msgs(today_s)
     convo = "\n".join(
         f"{'主人' if m.get('role') == 'user' else '姐妹'}：{(m.get('text') or '')[:120]}" for m in rows[-40:])
     if len(convo.strip()) < 30:
         return {"ok": False, "error": "今日对话太少，无可提炼"}
     prompt = COMIC_WRITER_PROMPT.format(today=today_s, convo=convo[:6000])
+    if _prev_same_day:
+        prompt += "\n\n（此前已生成过一版台词，这次请换不同的取材角度与侧重点，避免与上一版雷同。）"
     payload = None
     err = ""
     for _ in range(2):   # 失败重试 1 次
@@ -1164,7 +1174,7 @@ def _comic_payload():
     if not payload:
         return {"ok": False, "error": err or "文案解析失败"}
     json_str = json.dumps(payload, ensure_ascii=False)
-    gid = _comic_enqueue(json_str)
+    gid = _comic_enqueue(json_str, seed_base=(int(time.time()) % 900000 + 1000) if force else None)
     st = {"date": today_s, "payload": json_str, "gid": gid, "ts": time.time()}
     try:
         with open(COMIC_STATE_FILE, "w", encoding="utf-8") as f:
@@ -1175,10 +1185,13 @@ def _comic_payload():
     return {"ok": True, "duplicate": False, "date": today_s, "gid": gid, "payload": json_str}
 
 
-def _comic_enqueue(scene):
-    """v4.4.8 四格入队：who=comic kind=comic，scene=台词 JSON 全量（不走 _gen_enqueue 的 [:500] 截断）。"""
+def _comic_enqueue(scene, seed_base=None):
+    """v4.4.8 四格入队：who=comic kind=comic，scene=台词 JSON 全量（不走 _gen_enqueue 的 [:500] 截断）。
+    v4.4.9 seed_base：重画时传时间派生种子，轮询器透传 comic_diary --seed-base（防同日重画构图雷同）。"""
     gid = time.strftime("%H%M%S") + f"-{int(time.time() * 1000) % 10000:04d}"
     item = {"id": gid, "who": "comic", "kind": "comic", "scene": scene, "ts": time.time()}
+    if seed_base:
+        item["seed_base"] = int(seed_base)
     try:
         with open("/root/work/cloud-config/gen_queue.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -1195,6 +1208,14 @@ def _diary_token_hit(bare):
     """v4.4.7 日记令牌单口：去首尾空格后整条消息恰好=「日记」二字才命中（用户令「只打日记两个字」；
     「写日记」「日记？」等部分含「日记」的一概不触发=普通回话）。"""
     return bool(bare) and bare.strip() == "日记"
+
+
+def _diary_redraw_hit(bare):
+    """v4.4.9 重画令牌单口：去首尾+内部空格（全半角）后恰好=「日记重画」或「重画日记」才命中；
+    「帮我重画一下日记」等部分含词的一概不触发=普通回话（精确制同「日记」口）。"""
+    if not bare:
+        return False
+    return bare.strip().replace(" ", "").replace("\u3000", "") in ("日记重画", "重画日记")
 
 
 def _comic_markdown(ctx):
@@ -3288,14 +3309,15 @@ class Handler(BaseHTTPRequestHandler):
                 sys_head += "\n\n" + GEN_SKILL_BLOCK_TRIO
                 _add_inj("自拍技能", GEN_SKILL_BLOCK_TRIO)
                 print(f"[bridge] 自拍令牌命中(三人): {gen_hit_name}", flush=True)
-        # ==== v4.4.8 四格漫画令牌（只认「日记」二字；语义裁决 1113=改接四格漫画线，插画线回归 cron）====
+        # ==== v4.4.8/9 四格漫画令牌（「日记」=当日幂等看图；「重画日记」=强制重画；插画线回归 cron）====
         comic_ctx = None
-        if not is_task and _diary_token_hit(bare or ""):
-            comic_ctx = _comic_payload()   # 当日幂等；文案 GLM 2~15s，挂在装配期不额外占回合
+        if not is_task and (_diary_token_hit(bare or "") or _diary_redraw_hit(bare or "")):
+            _redraw = _diary_redraw_hit(bare or "")
+            comic_ctx = _comic_payload(force=_redraw)   # 当日幂等；文案 GLM 2~15s，挂在装配期不额外占回合
             if comic_ctx.get("ok"):
                 sys_head += "\n\n" + COMIC_SKILL_BLOCK
                 _add_inj("四格漫画技能", COMIC_SKILL_BLOCK)
-                print(f"[bridge] 日记令牌命中(三人·四格): dup={comic_ctx.get('duplicate', False)}", flush=True)
+                print(f"[bridge] 日记令牌命中(三人·四格): redraw={_redraw} dup={comic_ctx.get('duplicate', False)}", flush=True)
             else:
                 _cerr = str(comic_ctx.get("error") or "未知原因")
                 sys_head += "\n\n" + COMIC_FAIL_BLOCK_TMPL.format(err=_cerr)
@@ -3719,14 +3741,15 @@ class Handler(BaseHTTPRequestHandler):
                     sys_head += "\n\n" + GEN_SKILL_BLOCK
                     _add_inj("自拍技能", GEN_SKILL_BLOCK)
                     print(f"[bridge] 自拍令牌命中: {gen_hit_name}", flush=True)
-            # ==== v4.4.8 四格漫画令牌（只认「日记」二字；语义裁决 1113=改接四格漫画线，插画线回归 cron）====
+            # ==== v4.4.8/9 四格漫画令牌（「日记」=当日幂等看图；「重画日记」=强制重画；插画线回归 cron）====
             comic_ctx = None
-            if not is_task and not bare_test and _diary_token_hit(bare or ""):
-                comic_ctx = _comic_payload()   # 当日幂等
+            if not is_task and not bare_test and (_diary_token_hit(bare or "") or _diary_redraw_hit(bare or "")):
+                _redraw = _diary_redraw_hit(bare or "")
+                comic_ctx = _comic_payload(force=_redraw)   # 当日幂等；重画令牌=force 跳缓存
                 if comic_ctx.get("ok"):
                     sys_head += "\n\n" + COMIC_SKILL_BLOCK
                     _add_inj("四格漫画技能", COMIC_SKILL_BLOCK)
-                    print(f"[bridge] 日记令牌命中·四格: dup={comic_ctx.get('duplicate', False)}", flush=True)
+                    print(f"[bridge] 日记令牌命中·四格: redraw={_redraw} dup={comic_ctx.get('duplicate', False)}", flush=True)
                 else:
                     _cerr = str(comic_ctx.get("error") or "未知原因")
                     sys_head += "\n\n" + COMIC_FAIL_BLOCK_TMPL.format(err=_cerr)
