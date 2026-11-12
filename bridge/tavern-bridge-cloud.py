@@ -1,5 +1,24 @@
 # -*- coding: utf-8 -*-
 """
+v4.4.8（1113 深夜·日记令牌改接四格漫画线，用户语义裁决「日记=四格漫画+评分那套，不是睡前插画」）：
+触发口原样（_diary_token_hit 只认「日记」二字），但命中后改走 _comic_payload()：当天聊天(_today_msgs)
+→文案员提示词（四格漫画线-定档-20261015 正本移植）→GLM(max_tokens 2048, effort low)→容错 JSON 解析
+（剥```json栏/找边界/单引号修/失败重试 1 次/解析后值内英文双引号扫地出门）→comic_state.json 当日幂等
+→_comic_enqueue()（who=comic kind=comic，scene=台词 JSON 全量，不走 [:500] 截断）。回复=照 v4.4.7 模式：
+注入 COMIC_SKILL_BLOCK（角色口吻 1~2 句，禁复述台词）+流尾/非流式收口 _comic_markdown()——三姐妹台词+
+随缘评分 markdown 秒级可见，随后 _gen_wait_markdown(gid, timeout=300) 等四格整图嵌回（产图 3-4 分钟
+>默认 150，timeout 抬 300）。下游：PC 轮询器 v3 认 kind=="comic"→comic_diary.py 产 完整四格.png→
+genupload 同口上墙。v4.4.7 插画接线六处（两管线×检测/tail/收口）全部改接，DIARY_SKILL_BLOCK/
+DIARY_FAIL_BLOCK_TMPL/_diary_markdown/DIARY_WHO_CN 退役删除；_diary_token_hit 保留复用；v3.7.9 睡前
+插画线回归 21:00 cron 专用（_diary_trigger + /diary/* + crontab 全保留零改动）。
+v4.4.7（1113 凌晨·日记令牌上聊天线，用户令「能不能只打日记两个字」）：触发=去首尾空格后整条消息
+恰好是「日记」二字（_diary_token_hit 单口；「写日记」「日记？」等部分含「日记」的一概不触发=普通
+回话）。三人线+统一管线两检出点（任务调用/裸测关），命中即调 _diary_trigger()（v3.7.9 原口，当日
+幂等）：成功=注入 DIARY_SKILL_BLOCK（角色口吻 1~2 句告知写好了，禁复述内容）+回复尾 _diary_markdown
+追加日记全文引用块+插画——当日首次=同自拍等图 ≤150s（_gen_wait_markdown 原语）；同日重复触发=不再等
+直出 URL（GEN_STORE 内存态重启失忆，防吊满 150s）；失败（今日对话<30 字/GLM 空回）=注入
+DIARY_FAIL_BLOCK_TMPL 角色口吻转告（禁提系统术语）。图链与自拍完全同链：genqueue→PC 轮询器→ComfyUI
+→genupload 上墙（v3.7.9 T12 骨架零改动）。_diary_trigger 重复分支补 gen_id 字段。
 v4.4.6（1024·想法账本分类，用户令「开工吧」；调研+DeepSeek 会诊定案）：①词表=6 类稳定 ID
 （stock/work/study/life/relation/other，显示名住 ideas_categories.json 可改不动历史数据）；②<idea>
 第四段=分类（可选）：用户口述（含别名映射）优先 source=user，模型从五实质类挑 source=model，
@@ -1031,7 +1050,7 @@ def _diary_trigger():
     st = _diary_read()
     if st.get("date") == today_s and st.get("diary"):
         return {"ok": True, "duplicate": True, "date": today_s, "who": st.get("who", ""),
-                "diary": st.get("diary", ""), "image": f"/gen/{st.get('gen_id', '')}.png"}
+                "gen_id": st.get("gen_id", ""), "diary": st.get("diary", ""), "image": f"/gen/{st.get('gen_id', '')}.png"}   # v4.4.7 补 gen_id（日记令牌等图/直出要用）
     rows = _today_msgs(today_s)
     convo = "\n".join(
         f"{'主人' if m.get('role') == 'user' else '姐妹'}：{(m.get('text') or '')[:120]}" for m in rows[-40:])
@@ -1053,7 +1072,149 @@ def _diary_trigger():
     except Exception:
         pass
     _log(f"[diary] {today_s} 日记就绪 who={who} gen={gid}")
-    return {"ok": True, "date": today_s, "who": who, "diary": diary, "image": f"/gen/{gid}.png"}
+    return {"ok": True, "date": today_s, "who": who, "gen_id": gid, "diary": diary, "image": f"/gen/{gid}.png"}   # v4.4.7 补 gen_id（fresh 分支同样要带，首测 19s 秒回抓漏）
+
+
+# ==== v4.4.8 四格漫画令牌（聊天线触发口；产线=comic_diary.py 经 PC 轮询器 v3；插画线回归 21:00 cron 专用）====
+COMIC_STATE_FILE = "/root/work/cloud-config/comic_state.json"
+COMIC_SKILL_BLOCK = ("【日记技能·本次用户消息就是「日记」两个字时启用】\n"
+                     "系统此刻已经在后台把今天的聊天整理成了四格日记漫画的台词，并开始画四格漫画。"
+                     "台词内容和评分你并不知道，禁止复述台词或评分、禁止描写画画过程。你的任务："
+                     "用当前说话角色的口吻自然地回 1~2 句话，告诉他今天的日记漫画已经开画，几分钟就好。"
+                     "禁止输出 <gen> 或 <idea> 行。")
+COMIC_FAIL_BLOCK_TMPL = ("【日记技能·这次没写成】\n"
+                         "用户发来了「日记」请求，但系统这次没能整理成漫画（原因：{err}）。"
+                         "用当前角色的口吻自然地回 1~2 句话：原因是「今日对话太少」就催他多聊几句再来；"
+                         "其他原因就让他稍后再试一次。禁止提系统、报错、文件、记录这类字眼。")
+COMIC_WRITER_PROMPT = ("你是四格日记漫画的文案员。输入是主人一天的聊天记录，输出严格 JSON（不带任何多余文字）：\n"
+                       '{{"date":"M月D日","rem":"台词","ram":"台词","emt":"台词","score":88,"reason":"理由"}}\n\n'
+                       "三位人设与口吻（台词第一人称自称）：\n"
+                       "- rem 雷姆：蓝发女仆，温柔体贴行动派，自称「雷姆」。软糯主动，会提到为主人做的事（做饭/点心/照顾）。\n"
+                       "- ram 拉姆：粉发女仆，毒舌傲娇，自称「拉姆」。表面嫌弃实则关心，「勉强及格」「还行吧」式点评，结尾带口是心非的关心。\n"
+                       "- emt 艾米莉亚：银发半精灵，温和鼓励，自称「艾米莉亚」。正面肯定+温柔叮嘱（早休息/多喝水/明天加油）。\n\n"
+                       "硬性要求：\n"
+                       "1. 三句台词必须从今天聊天记录的真实事件取材，禁止空话套话。\n"
+                       "2. 每句台词 45~55 字（含标点），一句到底不换行。\n"
+                       "3. score：0~100 整数，凭整天感觉随缘给分，不打分项明细。\n"
+                       "4. reason：45~55 字，一句话评分理由，语气像三位一起说的。\n"
+                       "5. 台词与理由内禁用英文双引号 \" （会破坏 JSON 与气泡渲染），引用用「」。\n\n"
+                       "以下是主人与宅邸姐妹今天（{today}）的对话流水，请据此产出 JSON：\n\n{convo}")
+
+
+def _comic_read():
+    try:
+        return json.load(open(COMIC_STATE_FILE, encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _comic_json_parse(raw):
+    """文案员回包容错解析：剥 ```json 栏 → 找 {..} 边界 → loads；失败试单引号修；
+    再失败回 None（由调用方重试 1 次）。解析成功后值内英文双引号扫地出门（气泡渲染红线）。"""
+    if not raw:
+        return None
+    t = raw.strip()
+    m = re.search(r"```(?:json)?\s*(\{.*\})\s*```", t, re.S)
+    if m:
+        t = m.group(1)
+    else:
+        a, b = t.find("{"), t.rfind("}")
+        if a < 0 or b <= a:
+            return None
+        t = t[a:b + 1]
+    j = None
+    for attempt in (t, t.replace("'", '"')):
+        try:
+            j = json.loads(attempt)
+            break
+        except Exception:
+            continue
+    if not isinstance(j, dict) or not all(k in j for k in ("rem", "ram", "emt", "score", "reason", "date")):
+        return None
+    try:
+        j["score"] = int(j.get("score") or 0)
+    except Exception:
+        j["score"] = 0
+    for k in ("rem", "ram", "emt", "reason", "date"):
+        j[k] = str(j.get(k) or "").replace('"', '「')   # 硬红线：值内英文双引号一律换「
+    return j
+
+
+def _comic_payload():
+    """v4.4.8 四格漫画当日幂等：已生成直接回；否则 当天聊天→文案员 GLM→台词 JSON→入队→落 state。
+    返回 {"ok":True,"duplicate":…,"date":…,"gid":…,"payload":<台词 JSON 字符串>} 或 {"ok":False,"error":…}。"""
+    today_s = datetime.now(CN_TZ).strftime("%Y-%m-%d")
+    st = _comic_read()
+    if st.get("date") == today_s and st.get("gid"):
+        return {"ok": True, "duplicate": True, "date": today_s, "gid": st.get("gid", ""),
+                "payload": st.get("payload", "")}
+    rows = _today_msgs(today_s)
+    convo = "\n".join(
+        f"{'主人' if m.get('role') == 'user' else '姐妹'}：{(m.get('text') or '')[:120]}" for m in rows[-40:])
+    if len(convo.strip()) < 30:
+        return {"ok": False, "error": "今日对话太少，无可提炼"}
+    prompt = COMIC_WRITER_PROMPT.format(today=today_s, convo=convo[:6000])
+    payload = None
+    err = ""
+    for _ in range(2):   # 失败重试 1 次
+        raw, err = _glm_once([{"role": "user", "content": prompt}], max_tokens=2048, effort="low")
+        payload = _comic_json_parse(raw)
+        if payload:
+            break
+    if not payload:
+        return {"ok": False, "error": err or "文案解析失败"}
+    json_str = json.dumps(payload, ensure_ascii=False)
+    gid = _comic_enqueue(json_str)
+    st = {"date": today_s, "payload": json_str, "gid": gid, "ts": time.time()}
+    try:
+        with open(COMIC_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(st, f, ensure_ascii=False)
+    except Exception:
+        pass
+    _log(f"[comic] {today_s} 台词就绪 gid={gid}")
+    return {"ok": True, "duplicate": False, "date": today_s, "gid": gid, "payload": json_str}
+
+
+def _comic_enqueue(scene):
+    """v4.4.8 四格入队：who=comic kind=comic，scene=台词 JSON 全量（不走 _gen_enqueue 的 [:500] 截断）。"""
+    gid = time.strftime("%H%M%S") + f"-{int(time.time() * 1000) % 10000:04d}"
+    item = {"id": gid, "who": "comic", "kind": "comic", "scene": scene, "ts": time.time()}
+    try:
+        with open("/root/work/cloud-config/gen_queue.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    with GEN_LOCK:
+        GEN_PENDING.append(item)
+        GEN_STORE[gid] = {"status": "pending", "png": b"", "ts": time.time()}
+    _log(f"[comic] 排队 {gid} scene={scene[:40]}")
+    return gid
+
+
+def _diary_token_hit(bare):
+    """v4.4.7 日记令牌单口：去首尾空格后整条消息恰好=「日记」二字才命中（用户令「只打日记两个字」；
+    「写日记」「日记？」等部分含「日记」的一概不触发=普通回话）。"""
+    return bool(bare) and bare.strip() == "日记"
+
+
+def _comic_markdown(ctx):
+    """v4.4.8 四格回复尾：三姐妹台词+随缘评分 markdown（文案命中时已到手，秒级可见）+等整图。
+    当日首次=等四格（timeout 300：产图 3-4 分钟 > 默认 150）；同日重复=不再等直出 URL
+    （GEN_STORE 内存态重启失忆，防吊满 300s；图在墙=正常渲染）。"""
+    try:
+        j = json.loads(ctx.get("payload") or "{}")
+    except Exception:
+        j = {}
+    _md = (f"📔 **今日四格日记**（{j.get('date') or ctx.get('date', '')}）\n\n"
+           f"> **雷姆**：{j.get('rem', '')}\n>\n"
+           f"> **拉姆**：{j.get('ram', '')}\n>\n"
+           f"> **艾米莉亚**：{j.get('emt', '')}\n>\n"
+           f"> **随缘评分：{j.get('score', '')}分** —— {j.get('reason', '')}")
+    _gid = ctx.get("gid") or ""
+    if ctx.get("duplicate"):
+        return _md + ((f"\n\n![](/gen/{_gid}.png)") if _gid else "")
+    _img = _gen_wait_markdown(_gid, timeout=300)
+    return _md + (("\n\n" + _img) if _img else "")
 
 
 def _bond_summary(st):
@@ -3127,6 +3288,19 @@ class Handler(BaseHTTPRequestHandler):
                 sys_head += "\n\n" + GEN_SKILL_BLOCK_TRIO
                 _add_inj("自拍技能", GEN_SKILL_BLOCK_TRIO)
                 print(f"[bridge] 自拍令牌命中(三人): {gen_hit_name}", flush=True)
+        # ==== v4.4.8 四格漫画令牌（只认「日记」二字；语义裁决 1113=改接四格漫画线，插画线回归 cron）====
+        comic_ctx = None
+        if not is_task and _diary_token_hit(bare or ""):
+            comic_ctx = _comic_payload()   # 当日幂等；文案 GLM 2~15s，挂在装配期不额外占回合
+            if comic_ctx.get("ok"):
+                sys_head += "\n\n" + COMIC_SKILL_BLOCK
+                _add_inj("四格漫画技能", COMIC_SKILL_BLOCK)
+                print(f"[bridge] 日记令牌命中(三人·四格): dup={comic_ctx.get('duplicate', False)}", flush=True)
+            else:
+                _cerr = str(comic_ctx.get("error") or "未知原因")
+                sys_head += "\n\n" + COMIC_FAIL_BLOCK_TMPL.format(err=_cerr)
+                _add_inj("四格漫画技能·失败", _cerr)
+                print(f"[bridge] 日记令牌失败(三人·四格): {_cerr}", flush=True)
         hist = fetch_history_messages("st-live", tail=40)
         pmsg = [{"role": "system", "content": sys_head + "\n\n" + draft + (("\n\n" + _reality) if _reality else "")}] + hist   # v3.8.2 现实锚挪尾部保前缀缓存
         if not is_task:
@@ -3155,6 +3329,10 @@ class Handler(BaseHTTPRequestHandler):
                 _gid = _gen_enqueue(_tg, _gen_who(_nm, gen_hit_name))   # v4.2.6b who 终审
                 return _gen_wait_markdown(_gid)
 
+            def _diary_tail():
+                # v4.4.8 流尾：台词+评分秒回+等四格整图（首触 ≤300s / 同日重复直出 URL）
+                return _comic_markdown(comic_ctx) if (comic_ctx and comic_ctx.get("ok")) else None
+
             text = zhipu_stream_relay(self, pmsg, model=B["label"], max_tokens=B["max_tokens"],
                                       temperature=_P('reply_temperature'), reasoning=B["effort"] or "low",
                                       upstream=B["upstream"], glm_params=B["glm"], model_name=B.get("model_name"),
@@ -3162,7 +3340,7 @@ class Handler(BaseHTTPRequestHandler):
                                       no_think=B.get("no_think", False),
                                       gen_filter=_exg,
                                       idea_filter=_ixf,
-                                      tail_supplier=(_gen_tail if _exg else None))
+                                      tail_supplier=(_gen_tail if _exg else (_diary_tail if (comic_ctx and comic_ctx.get("ok")) else None)))
             if _exg:
                 text = GEN_LINE_ANY_RE.sub("", GEN_LINE_RE.sub("", text)).strip()   # v4.2.6 写回剥行加宽容式（relay 返回原文）
             if _ixf:   # v4.4.5 存档收口：后台入库（fail-open）+写回剥行（宽容式防畸形行进 chat_memory）
@@ -3208,6 +3386,10 @@ class Handler(BaseHTTPRequestHandler):
                         _gmd = _gen_wait_markdown(_gid)
                         if _gmd:
                             text = text + "\n\n" + _gmd
+            if comic_ctx and comic_ctx.get("ok"):   # v4.4.8 非流式四格收口：台词+评分+整图
+                _cmm = _comic_markdown(comic_ctx)
+                if _cmm:
+                    text = text + "\n\n" + _cmm
             if not is_task:   # v4.4.5 非流式存档收口：剥行+后台入库
                 _ip = _idea_parse(text)
                 if _ip:
@@ -3537,6 +3719,19 @@ class Handler(BaseHTTPRequestHandler):
                     sys_head += "\n\n" + GEN_SKILL_BLOCK
                     _add_inj("自拍技能", GEN_SKILL_BLOCK)
                     print(f"[bridge] 自拍令牌命中: {gen_hit_name}", flush=True)
+            # ==== v4.4.8 四格漫画令牌（只认「日记」二字；语义裁决 1113=改接四格漫画线，插画线回归 cron）====
+            comic_ctx = None
+            if not is_task and not bare_test and _diary_token_hit(bare or ""):
+                comic_ctx = _comic_payload()   # 当日幂等
+                if comic_ctx.get("ok"):
+                    sys_head += "\n\n" + COMIC_SKILL_BLOCK
+                    _add_inj("四格漫画技能", COMIC_SKILL_BLOCK)
+                    print(f"[bridge] 日记令牌命中·四格: dup={comic_ctx.get('duplicate', False)}", flush=True)
+                else:
+                    _cerr = str(comic_ctx.get("error") or "未知原因")
+                    sys_head += "\n\n" + COMIC_FAIL_BLOCK_TMPL.format(err=_cerr)
+                    _add_inj("四格漫画技能·失败", _cerr)
+                    print(f"[bridge] 日记令牌失败·四格: {_cerr}", flush=True)
             # ==== v3.7.5 时光与羁绊（好感度账本+相识天数+回忆杀；任务调用不记不注入；fail-open）====
             st, aff_delta, _nost, _exam = None, 0, None, None
             if not is_task:
@@ -3616,13 +3811,17 @@ class Handler(BaseHTTPRequestHandler):
                     _gid = _gen_enqueue(_tg, _gen_who(_nm, gen_hit_name))   # v4.2.6b who 终审
                     return _gen_wait_markdown(_gid)
 
+                def _diary_tail():
+                    # v4.4.8 流尾：台词+评分秒回+等四格整图（首触 ≤300s / 同日重复直出 URL）
+                    return _comic_markdown(comic_ctx) if (comic_ctx and comic_ctx.get("ok")) else None
+
                 text = zhipu_stream_relay(self, pmsg, model=B["label"], max_tokens=B["max_tokens"],
                                           temperature=_P('reply_temperature'), reasoning=B["effort"] or "low",
                                           upstream=B["upstream"], glm_params=B["glm"], model_name=B.get("model_name"),
                                           expr_who=(None if is_task else solo_who), no_think=B.get("no_think", False),
                                           gen_filter=_exg,
                                           idea_filter=_ixf,
-                                          tail_supplier=(_gen_tail if _exg else None))
+                                          tail_supplier=(_gen_tail if _exg else (_diary_tail if (comic_ctx and comic_ctx.get("ok")) else None)))
                 if _exg:
                     text = GEN_LINE_ANY_RE.sub("", GEN_LINE_RE.sub("", text)).strip()   # v4.2.6 写回剥行加宽容式（relay 返回原文）
                 if _ixf:   # v4.4.5 存档收口：后台入库（fail-open）+写回剥行
@@ -3671,6 +3870,10 @@ class Handler(BaseHTTPRequestHandler):
                     _gmd = _gen_wait_markdown(want_gen_id)   # 无行=want_gen_id None=静默（决策5）
                     if _gmd:
                         text = text + "\n\n" + _gmd
+                if comic_ctx and comic_ctx.get("ok"):   # v4.4.8 非流式四格收口：台词+评分+整图
+                    _cmm = _comic_markdown(comic_ctx)
+                    if _cmm:
+                        text = text + "\n\n" + _cmm
                 if not is_task:   # v4.4.5 非流式存档收口：剥行+后台入库
                     _ip = _idea_parse(text)
                     if _ip:
