@@ -1,0 +1,24 @@
+# 密钥与凭证——结构性禁入
+*.key
+*.env
+.env*
+config.local.*
+**/secrets/
+*_key*
+!**/*_key*.sample
+
+# 运行时数据
+*.log
+*.sqlite
+*.db
+data/
+logs/
+node_modules/
+__pycache__/
+.venv/
+venv/
+
+# 系统杂件
+.DS_Store
+Thumbs.db
+_DRAFT/
