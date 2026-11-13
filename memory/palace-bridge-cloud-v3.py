@@ -338,8 +338,9 @@ def _rescore(query, items, want, qvec=None):
         return items[:int(want)]
 
 
-def recall(query, limit=3, qvec=None):
-    """只读召回：search 工具语义搜「主人」wing 的记忆抽屉。（v2 原样零改动；v3.2.0 收 qvec 透传重打分）"""
+def recall(query, limit=3, qvec=None, wing=None):
+    """只读召回：search 工具语义搜指定 wing 的记忆抽屉（v3.2.3 可选 wing，默认「主人」零行为变；
+    蒸馏翼「记忆蒸馏」专线走 wing=记忆蒸馏）。（v2 原样零改动；v3.2.0 收 qvec 透传重打分）"""
     global _SEARCH
     q = str(query or "").strip()
     if not q:
@@ -355,15 +356,17 @@ def recall(query, limit=3, qvec=None):
             return {"items": [], "error": "mempalace-mcp 无搜索工具"}
         try:
             res = _rpc("tools/call", {"name": _SEARCH, "arguments": {
-                "query": q, "wing": WING, "limit": 300}}, msg_id=900, timeout=60)   # v3.1.3 池恒 300（1,942 抽屉时代 60 只见 3%；同尺 qwen3-emb 后 300=真 top300）
+                "query": q, "wing": (str(wing).strip() if wing else WING), "limit": 300}}, msg_id=900, timeout=60)   # v3.1.3 池恒 300（1,942 抽屉时代 60 只见 3%；同尺 qwen3-emb 后 300=真 top300）
         except Exception as e:
             return {"items": [], "error": str(e)[:150]}
     _tB = time.time()
     raw = _dig_text(res)
     items = []
+    _parsed_ok = False   # v3.2.3 空结果信封（{"results":[]}）解析成功就不走 raw 兜底——空翼搜索曾被打 0.87 伪条混过 0.55 筛（1113 蒸馏翼验活实锤）
     try:
         data = json.loads(raw)
         if isinstance(data, list):
+            _parsed_ok = True
             for d in data:
                 if isinstance(d, dict):
                     items.append({"room": str(d.get("room") or d.get("wing") or ""),
@@ -371,6 +374,7 @@ def recall(query, limit=3, qvec=None):
                                   "title": str(d.get("title") or d.get("name") or ""),
                                   "text": str(d.get("content") or d.get("text") or "")[:400]})
         elif isinstance(data, dict):
+            _parsed_ok = True
             for d in (data.get("results") or data.get("drawers") or data.get("items") or []):
                 if isinstance(d, dict):
                     items.append({"room": str(d.get("room") or d.get("wing") or ""),
@@ -379,7 +383,7 @@ def recall(query, limit=3, qvec=None):
                                   "text": str(d.get("content") or d.get("text") or "")[:400]})
     except Exception:
         pass
-    if not items and raw.strip():
+    if not items and raw.strip() and not _parsed_ok:
         items = [{"room": "", "title": "", "text": raw[:600]}]
     items = [it for it in items if len((it.get("text") or "").strip()) >= 10]
     items = _rescore(q, items, int(limit), qvec)   # v3.1 重打分+重排（v3.2.0 桥侧向量直挂）
@@ -397,8 +401,8 @@ def api_taxonomy():
     return t
 
 
-def api_list(room=None, limit=50, offset=0):
-    args = {"wing": WING, "limit": int(limit), "offset": int(offset)}
+def api_list(room=None, limit=50, offset=0, wing=None):
+    args = {"wing": (str(wing).strip() if wing else WING), "limit": int(limit), "offset": int(offset)}
     if room:
         args["room"] = room
     return _tool("list", args)
@@ -408,9 +412,9 @@ def api_get(did):
     return _tool("get", {"drawer_id": did})
 
 
-def api_add(room, title, text, added_by="console-web"):
+def api_add(room, title, text, added_by="console-web", wing=None):
     content = f"【{title}】\n\n{text}" if title else text
-    return _tool("add", {"wing": WING, "room": room or "生活", "content": content,
+    return _tool("add", {"wing": (str(wing).strip() if wing else WING), "room": room or "生活", "content": content,
                          "added_by": added_by, "source_file": f"{SRC}#console-{title[:30]}"}, timeout=120)
 
 
@@ -455,11 +459,12 @@ class H(http.server.BaseHTTPRequestHandler):
             if path.rstrip("/") in ("/healthz", "/"):
                 self._send(200, {"status": "ok", "service": "mempalace-ingest-bridge",
                                  "recall": True, "manage": True, "embedder": _EMBEDDER_OK,
-                                 "version": "v3.2.2"})
+                                 "version": "v3.2.3"})
             elif path == "/taxonomy":
                 self._send(200, api_taxonomy())
             elif path == "/list":
-                self._send(200, api_list(p.get("room"), int(p.get("limit") or 50), int(p.get("offset") or 0)))
+                self._send(200, api_list(p.get("room"), int(p.get("limit") or 50), int(p.get("offset") or 0),
+                                         wing=p.get("wing")))
             elif path == "/get":
                 self._send(200, api_get(p.get("id") or ""))
             else:
@@ -479,10 +484,12 @@ class H(http.server.BaseHTTPRequestHandler):
                     return
                 self._send(200, ingest(items))
             elif path == "/recall":
-                self._send(200, recall(req.get("query"), req.get("limit") or 3, req.get("query_vector")))
+                self._send(200, recall(req.get("query"), req.get("limit") or 3, req.get("query_vector"),
+                                       wing=req.get("wing")))
             elif path == "/add":
                 self._send(200, api_add(str(req.get("room") or ""), str(req.get("title") or ""),
-                                        str(req.get("text") or ""), str(req.get("added_by") or "console-web")))
+                                        str(req.get("text") or ""), str(req.get("added_by") or "console-web"),
+                                        wing=req.get("wing")))
             elif path == "/update":
                 self._send(200, api_update(str(req.get("id") or ""), str(req.get("content") or ""),
                                            req.get("room")))
@@ -536,7 +543,7 @@ def _embedder_selfcheck():
 
 if __name__ == "__main__":
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), H)
-    print(f"记忆宫桥 v3.2.2 已起 :{PORT} → wing={WING}（/ingest+/recall 原样 + /taxonomy /list /get /add /update /delete 管理口，删前自动备份；v3.2.2=启动自检（30s 真召回,error 即横幅爆红+healthz 报 embedder:false,治哑错）+唯一启动件 restart-palace.sh 配套,1020 漏 env 血案治标）；v3.2.1=管理口钉单数工具（MemPalace3.11 单/复数分家,解析器循环后写盖前写,get/delete 曾误中批量版→点开/删除坏,1020 修）；v3.2.0=向量缓存落盘+全量miss后台补嵌（首字三刀刀1，配合桥 v4.2.9）；v3.1.3=池恒300+预热30；v3.1.4=recall 透传 drawer_id）", flush=True)
+    print(f"记忆宫桥 v3.2.3 已起 :{PORT} → wing={WING}（/ingest+/recall 原样 + /taxonomy /list /get /add /update /delete 管理口，删前自动备份；v3.2.3=/recall+/add+/list 可选 wing 参数（默认主人零行为变，蒸馏翼「记忆蒸馏」专线，1113 深忆蒸馏索引配套）；v3.2.2=启动自检（30s 真召回,error 即横幅爆红+healthz 报 embedder:false,治哑错）+唯一启动件 restart-palace.sh 配套,1020 漏 env 血案治标）；v3.2.1=管理口钉单数工具（MemPalace3.11 单/复数分家,解析器循环后写盖前写,get/delete 曾误中批量版→点开/删除坏,1020 修）；v3.2.0=向量缓存落盘+全量miss后台补嵌（首字三刀刀1，配合桥 v4.2.9）；v3.1.3=池恒300+预热30；v3.1.4=recall 透传 drawer_id）", flush=True)
     _emb_load()   # v3.2.0 重启不空窗
     threading.Thread(target=_filler, daemon=True).start()   # v3.2.0 后台补嵌
     threading.Thread(target=_embedder_selfcheck, daemon=True).start()   # v3.2.2 启动自检（错了必响）

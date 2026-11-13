@@ -1244,6 +1244,7 @@ def _diary_redraw_hit(bare):
 # 取 top5。实测铁律：改写必须输出完整自然句（关键词串=分布外负优化 0.629 vs 原句 0.741）。
 DEEP_TOKEN = "深忆"
 DEEP_MIN_SCORE = 0.55   # 与酒馆统一标定线（正例 0.72/噪声带 0.42-0.46）
+DEEP_FACTS_WING = "记忆蒸馏"   # v4.5.1 蒸馏翼（Mem0 式事实短句层，palace_distill.py 产出；深忆专线并搜，普通召回零影响）
 
 DEEP_GUIDE_BLOCK = ("【深挖记忆】（主人想认真翻一段往事，但还没说是哪段。"
                     "用你的口吻自然地问他想聊的是哪件事，可以提示他给一点线索（大概时间、关键词都行），"
@@ -1302,17 +1303,21 @@ def _deep_condense(q):
         return ""
 
 
-def _palace_raw(query, limit=6):
+def _palace_raw(query, limit=6, wing=None):
     """v4.5.0 宫 /recall 裸口：返回 [(score,text)] 原始列表（不过筛不截断，去重合并由调用方做）。
-    带查询向量免宫侧重嵌（同 palace_recall_block v4.2.9b 姿势）；失败空列表。"""
+    带查询向量免宫侧重嵌（同 palace_recall_block v4.2.9b 姿势）；失败空列表。
+    v4.5.1 可选 wing（蒸馏翼专线）；过滤无 drawer_id 无 room 的信封伪条（宫桥已治，双保险）。"""
     try:
         _body = {"query": query, "limit": limit}
+        if wing:
+            _body["wing"] = wing
         _v = _vec_for(query)
         if _v:
             _body["query_vector"] = _v
         r = httpx.post(PALACE_RECALL, timeout=20, json=_body)
         return [(float(i.get("score") or 0), str(i.get("text") or "").strip())
-                for i in (r.json().get("items") or []) if str(i.get("text") or "").strip()]
+                for i in (r.json().get("items") or [])
+                if str(i.get("text") or "").strip() and (i.get("drawer_id") or i.get("room"))]
     except Exception:
         return []
 
@@ -1320,27 +1325,34 @@ def _palace_raw(query, limit=6):
 def _deep_recall_block(q):
     """v4.5.0 深忆注入块：原句+GLM 扩展句两路并搜宫 → 按 text 前 50 字去重（同段取高分）→
     ≥0.55 筛取 top5（平时召回 top3，深忆加倍）。两路全空 → 诚实空态块（禁硬猜，用户点名要）。
-    q 为空（裸打「深忆」）→ 引导块（问要翻哪段）。q2 改写失败/与原句同 → 自动单路。"""
+    q 为空（裸打「深忆」）→ 引导块（问要翻哪段）。q2 改写失败/与原句同 → 自动单路。
+    v4.5.1 加蒸馏翼两路（原句+扩展句 × wing=记忆蒸馏）：Mem0 式事实短句层，模糊查询的语义锚点。"""
     try:
         _DEEP_LAST["mode"] = "off"
         if not q or not q.strip():
             _DEEP_LAST["mode"] = "guide"
             return DEEP_GUIDE_BLOCK
         t0 = time.time()
-        items_a = _palace_raw(q)
+        items_a = _palace_raw(q)                              # 原句 × 原始翼
         _a_top = round(items_a[0][0], 3) if items_a else 0.0
+        items_c = _palace_raw(q, wing=DEEP_FACTS_WING)        # 原句 × 蒸馏翼
+        _c_top = round(items_c[0][0], 3) if items_c else 0.0
         q2 = _deep_condense(q)
-        items_b = _palace_raw(q2) if q2 else []
+        items_b = _palace_raw(q2) if q2 else []               # 扩展句 × 原始翼
         _b_top = round(items_b[0][0], 3) if items_b else 0.0
+        items_d = _palace_raw(q2, wing=DEEP_FACTS_WING) if q2 else []   # 扩展句 × 蒸馏翼
+        _d_top = round(items_d[0][0], 3) if items_d else 0.0
         merged = {}
-        for _s, _t in items_a + items_b:
+        for _s, _t in items_a + items_c + items_b + items_d:
             _k = re.sub(r"\s+", "", _t)[:50]
             if _k not in merged or _s > merged[_k][0]:
                 merged[_k] = (_s, _t)
         hits = sorted(merged.values(), key=lambda x: -x[0])
         hits = [(s, t) for s, t in hits if s >= DEEP_MIN_SCORE][:5]
+        hits = [(s, re.sub(r"^【蒸馏·[^】]*】\s*\n?", "", t)) for s, t in hits]   # v4.5.1 剥蒸馏翼头行（系统黑话不进提示词）
+        hits = [(s, t) for s, t in hits if t.strip()]
         _ms = int((time.time() - t0) * 1000)
-        _log(f"[deeprecall] 原句 top {_a_top} | 扩展「{q2[:30]}」 top {_b_top} | "
+        _log(f"[deeprecall] 原句 top {_a_top}/蒸馏 {_c_top} | 扩展「{q2[:24]}」 top {_b_top}/蒸馏 {_d_top} | "
              f"合并命中 {len(hits)} 条（top {round(hits[0][0], 3) if hits else 0.0}）耗时{_ms}ms")
         _rx()["recalls"].append({"source": "深挖记忆", "hits": [
             {"score": round(s, 3), "text": t[:200]} for s, t in hits]})
