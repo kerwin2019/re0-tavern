@@ -1,5 +1,16 @@
 # -*- coding: utf-8 -*-
 """
+v4.5.0（1113 午·深忆令牌，用户令「模糊查询召回不准，两个都做」之任务一）：消息前缀「深忆」=手动
+加强召回。链路=剥前缀（「深忆：xxx」「深忆，xxx」带分隔符同吃；裸打「深忆」无内容=引导块姐妹反问
+要翻哪段）→ _deep_condense()（GLM 5.3-flash low temperature 0.3 max_tokens 150，LangChain
+condense-question 标准：最近 6 轮对话+问题合并改写成一句独立完整自然检索问句，实词全留/指代消解/
+禁引入对话外新知识——1113 实测铁律「关键词串=分布外负优化 0.629 vs 原句 0.741，改写必须自然句」；
+失败 fail-open 单路）→ _palace_raw()×2 两路并搜宫 /recall（原句+扩展句，各 limit 6 带查询向量）
+→ text 前 50 字去重同段取高分 → ≥0.55 筛取 top5（平时 top3 加倍）→【深挖记忆】块替换记忆宫路注入
+（三管线 duet/trio/unified 同接，deep_recall 旗 do_POST 入口单点判定剥前缀后传参，任务调用不触发）。
+两路全空=诚实空态块（明说印象里没有对应记录禁硬猜，用户点名「含糊像在猜」不可接受）。_glm_once 加
+temperature 可选参（None=现役行为零变）。日志 [deeprecall] 打两路 top/合并命中/耗时。零实词问法
+（「当时什么驱动我的」）改写救不了=固有极限，由诚实空态兜底。
 v4.4.9（1113 晨·重画令牌，用户醒后令「对图不满意想重新生成/演示要新鲜图」）：新增「重画日记」口
 （_diary_redraw_hit：「重画日记」「日记 重画」等去首尾+内部空格（全半角）后恰为四字才命中，精确制
 同「日记」口），命中= _comic_payload(force=True)：跳过当日幂等重新 文案→入队→覆盖 comic_state
@@ -1224,6 +1235,123 @@ def _diary_redraw_hit(bare):
     if not bare:
         return False
     return bare.strip().replace(" ", "").replace("\u3000", "") in ("日记重画", "重画日记")
+
+
+# ==== v4.5.0 深忆令牌（手动加强召回）：「深忆+事」=GLM condense 改写+两路并搜记忆宫合并注入 top5 ====
+# 1113 定案（HANDOFF-深忆令牌与蒸馏索引）：平时召回 top3 够用；模糊查询（零锚点历史泛指）原句直搜
+# 弱命中（0.65-0.67 卡 0.72 正例线下）→ 用户手动打「深忆」前缀换加强召回：GLM 把问题+最近对话
+# 合并改写成独立完整检索句（LangChain condense-question 标准），原句+扩展句两路并搜宫，合并去重
+# 取 top5。实测铁律：改写必须输出完整自然句（关键词串=分布外负优化 0.629 vs 原句 0.741）。
+DEEP_TOKEN = "深忆"
+DEEP_MIN_SCORE = 0.55   # 与酒馆统一标定线（正例 0.72/噪声带 0.42-0.46）
+
+DEEP_GUIDE_BLOCK = ("【深挖记忆】（主人想认真翻一段往事，但还没说是哪段。"
+                    "用你的口吻自然地问他想聊的是哪件事，可以提示他给一点线索（大概时间、关键词都行），"
+                    "禁止提「记忆库/资料/记录」这类字眼。）")
+
+DEEP_EMPTY_BLOCK = ("【深挖记忆·没有找到】（主人问的这件事，你翻遍了记忆深处：没有任何对应的真实记录，"
+                    "这件事你确实不记得。铁律：绝对禁止把它当真事接下去讲、追问它细节、或顺着他说话——"
+                    "那样就是在编造。正确做法只有一个：用你的口吻自然坦白这段你想不起来、印象里没有，"
+                    "请他多给点线索（大概时间、关键词），或问一句是不是记到别处去了。"
+                    "参考口吻：「这个……我真没什么印象哎，是不是记岔了？你再多给点线索，大概什么时候的事？」"
+                    "禁止提「记忆库/资料/记录/检索」这类字眼。）")
+
+DEEP_HIT_TMPL = ("【深挖记忆】（主人正在认真翻问过去的这段事，下面是按相关度翻出的真实往事片段。"
+                 "回答必须基于这些真实内容，禁止编造细节；片段不足以完整回答时，就诚实只说你记得的部分，"
+                 "不确定的别装确定；禁止提「记忆库/资料/记录/检索」这类字眼，像自然想起往事一样说出来。）\n")
+
+# v4.5.0b 诚实空态末位重申：空态块在系统头部会被用户断言式陈述的谄媚引力压过（1113 实测两连败：
+# 「青岛救人」假锚点姐妹顺演）——照 关怀钩子/存档意图 重申先例，贴 user 消息再压一句
+DEEP_EMPTY_REASSERT = ("【重申·这段你没有记忆】主人刚说的这件事，你真的没有任何印象——"
+                       "禁止把它当真事讲，禁止追问它的细节，禁止顺着他演下去。"
+                       "开口第一句就自然坦白这段你想不起来，请他多给点线索（大概时间/关键词），"
+                       "或问一句是不是记到别处去了。")
+
+_DEEP_LAST = {"mode": "off"}   # v4.5.0b 本轮深忆命中态（off/guide/empty/hit），末位重申判据；每轮深忆入口重置
+
+
+def _deep_condense(q):
+    """v4.5.0 condense-question（LangChain 标准）：最近对话+当前问题 → 一句独立完整检索问句。
+    改写定位=句式翻译器：消解指代、去语气壳，实词全保留；禁引入对话外新知识。
+    GLM 5.3-flash low（走 8317 网关同 _glm_once，≈0.01 元/次）；失败返回 ""（fail-open 单路）。"""
+    try:
+        hist = fetch_history_messages("st-live", tail=6)
+        _lines = []
+        for m in hist[-6:]:
+            _c = re.sub(r"^深忆[:：,，。\s]*", "", (m.get("content") or "")).strip()
+            if _c:
+                _lines.append(("用户" if m.get("role") == "user" else "你") + "：" + _c[:200])
+        _ctx = "\n".join(_lines) or "（无）"
+        _sys = ("你是检索查询改写器。任务：把「用户最新问题」和「最近对话」合并改写成一句独立、完整、自然的中文检索问句，"
+                "让它不依赖对话上下文也能被语义检索理解。规则：1）保留问题里的全部实词；"
+                "2）把代词和指代（那个/它/上次说的）替换成对话里指的具体事物；"
+                "3）只允许使用问题和对话中出现过的信息，禁止引入对话里没有的事件、名词或知识；"
+                "4）去掉语气词和寒暄壳；5）输出一句完整自然的问句（不要关键词堆叠），不超过 60 字；"
+                "6）只输出这一句，不要任何解释、前缀或引号。")
+        _msgs = [{"role": "system", "content": _sys},
+                 {"role": "user", "content": f"最近对话：\n{_ctx}\n\n用户最新问题：{q}\n\n改写后的检索问句："}]
+        t, err = _glm_once(_msgs, max_tokens=150, effort="low", temperature=0.3)
+        if err or not t:
+            return ""
+        _t = t.strip().splitlines()[0].strip()
+        _t = _t.strip(' "“”「」『』。：:').strip()
+        if not _t or _t == q:
+            return ""
+        return _t[:80]
+    except Exception:
+        return ""
+
+
+def _palace_raw(query, limit=6):
+    """v4.5.0 宫 /recall 裸口：返回 [(score,text)] 原始列表（不过筛不截断，去重合并由调用方做）。
+    带查询向量免宫侧重嵌（同 palace_recall_block v4.2.9b 姿势）；失败空列表。"""
+    try:
+        _body = {"query": query, "limit": limit}
+        _v = _vec_for(query)
+        if _v:
+            _body["query_vector"] = _v
+        r = httpx.post(PALACE_RECALL, timeout=20, json=_body)
+        return [(float(i.get("score") or 0), str(i.get("text") or "").strip())
+                for i in (r.json().get("items") or []) if str(i.get("text") or "").strip()]
+    except Exception:
+        return []
+
+
+def _deep_recall_block(q):
+    """v4.5.0 深忆注入块：原句+GLM 扩展句两路并搜宫 → 按 text 前 50 字去重（同段取高分）→
+    ≥0.55 筛取 top5（平时召回 top3，深忆加倍）。两路全空 → 诚实空态块（禁硬猜，用户点名要）。
+    q 为空（裸打「深忆」）→ 引导块（问要翻哪段）。q2 改写失败/与原句同 → 自动单路。"""
+    try:
+        _DEEP_LAST["mode"] = "off"
+        if not q or not q.strip():
+            _DEEP_LAST["mode"] = "guide"
+            return DEEP_GUIDE_BLOCK
+        t0 = time.time()
+        items_a = _palace_raw(q)
+        _a_top = round(items_a[0][0], 3) if items_a else 0.0
+        q2 = _deep_condense(q)
+        items_b = _palace_raw(q2) if q2 else []
+        _b_top = round(items_b[0][0], 3) if items_b else 0.0
+        merged = {}
+        for _s, _t in items_a + items_b:
+            _k = re.sub(r"\s+", "", _t)[:50]
+            if _k not in merged or _s > merged[_k][0]:
+                merged[_k] = (_s, _t)
+        hits = sorted(merged.values(), key=lambda x: -x[0])
+        hits = [(s, t) for s, t in hits if s >= DEEP_MIN_SCORE][:5]
+        _ms = int((time.time() - t0) * 1000)
+        _log(f"[deeprecall] 原句 top {_a_top} | 扩展「{q2[:30]}」 top {_b_top} | "
+             f"合并命中 {len(hits)} 条（top {round(hits[0][0], 3) if hits else 0.0}）耗时{_ms}ms")
+        _rx()["recalls"].append({"source": "深挖记忆", "hits": [
+            {"score": round(s, 3), "text": t[:200]} for s, t in hits]})
+        if not hits:
+            _DEEP_LAST["mode"] = "empty"
+            return DEEP_EMPTY_BLOCK
+        _DEEP_LAST["mode"] = "hit"
+        return DEEP_HIT_TMPL + "\n".join("· " + t for _s, t in hits)
+    except Exception:
+        _DEEP_LAST["mode"] = "off"
+        return ""
 
 
 def _comic_markdown(ctx):
@@ -2688,14 +2816,16 @@ def _load_duet_drafts():
     return ram, rem
 
 
-def _glm_once(messages, max_tokens=2048, effort="low"):
-    """双人同台专用单发（非流式路径用）；429 一发定胜负。返回 (text, err_msg)。"""
+def _glm_once(messages, max_tokens=2048, effort="low", temperature=None):
+    """双人同台专用单发（非流式路径用）；429 一发定胜负。返回 (text, err_msg)。
+    v4.5.0 temperature 可选参：None=沿用 reply_temperature（现役行为零变）；传值=覆盖（深忆改写用 0.3）。"""
     try:
         r = httpx.post(ZHIPU, timeout=300,
                        headers={"Authorization": f"Bearer {ZKEY}", "Content-Type": "application/json"},
                        json={"model": "glm-5.3-flash", "thinking": {"type": "enabled"},
                              "reasoning_effort": effort, "max_tokens": max_tokens,
-                             "temperature": _P("reply_temperature"), "messages": messages})
+                             "temperature": _P("reply_temperature") if temperature is None else temperature,
+                             "messages": messages})
         if r.status_code == 429:
             return "", (QUOTA_DEAD_MSG if _quota_dead(r.text) else RATE_LIMIT_MSG)
         r.raise_for_status()
@@ -3094,7 +3224,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return "拉姆：" + ram_text + "\n\n蕾姆：" + rem_text
 
-    def _duet(self, user_multimodal, bare, want_stream, is_task, brain_id):
+    def _duet(self, user_multimodal, bare, want_stream, is_task, brain_id, deep_recall=False):
         """v3.5.7 双人同台：拉姆先说→她的原话进上下文→雷姆真接。写回/审计一次。"""
         t0 = time.time()
         label = BRAINS[brain_id]["label"]
@@ -3139,7 +3269,8 @@ class Handler(BaseHTTPRequestHandler):
         for _nm, blk in _recall_family(bare, (("往日日志", lambda: journal_block(bare)),
                                               ("记忆库", lambda: kb_memory_block(bare)),
                                               ("场景库", lambda: kb_scene_block(bare)),
-                                              ("记忆宫", lambda: palace_recall_block(bare, _vec_for(bare))))):
+                                              ("记忆宫", (lambda: _deep_recall_block(bare)) if (deep_recall and not is_task)
+                                               else lambda: palace_recall_block(bare, _vec_for(bare))))):
             if blk:
                 sys_head += "\n\n" + blk
                 _add_inj(_nm, blk)
@@ -3156,11 +3287,15 @@ class Handler(BaseHTTPRequestHandler):
                        "（从前情提要里挑真有过的事），然后才回应他这条消息。"})
         p1.append({"role": "system", "content": EXPR_REASSERT})   # v3.5.8.1
         p1.append({"role": "system", "content": DUET_RAM_REASSERT})   # v3.7.3 末位重申：压 40 条双人 few-shot 防第一棒越界代言蕾姆
+        if deep_recall and _DEEP_LAST.get("mode") == "empty":   # v4.5.0b 诚实空态末位重申（贴 user 压谄媚）
+            p1.append({"role": "system", "content": DEEP_EMPTY_REASSERT})
         p1.append({"role": "user", "content": user_content})
 
         # 第二轮：雷姆（拉姆的原话紧跟在 user 之后进上下文）
         p2 = [{"role": "system", "content": sys_head + "\n\n" + DUET_REM_DIRECTIVE + "\n\n" + rem_draft + _expr_tail}]
         p2 += hist
+        if deep_recall and _DEEP_LAST.get("mode") == "empty":   # v4.5.0b 诚实空态末位重申（两棒都要）
+            p2.append({"role": "system", "content": DEEP_EMPTY_REASSERT})
         p2.append({"role": "user", "content": user_content})
         p2.append({"role": "assistant", "content": ""})   # 占位：拉姆原话在第一轮后才回填
         _ph2 = len(p2) - 1   # v3.7.2 占位绝对索引（负索引 p2[-2] 自 v3.5.8.1 尾部追加 EXPR_REASSERT 起错位，勿复用）
@@ -3248,7 +3383,7 @@ class Handler(BaseHTTPRequestHandler):
                         "expr": {"tags": len(EXPR_TAG_RE.findall(combined))}, "error": None})   # v3.7.3 duet 小票（原缺）
         _log(f"{brain_id} 回复({round(time.time() - t0, 1)}s): {combined[:60]}")
 
-    def _trio(self, user_multimodal, bare, want_stream, is_task, brain_id, serious_mode=False):
+    def _trio(self, user_multimodal, bare, want_stream, is_task, brain_id, serious_mode=False, deep_recall=False):
         """v3.7.0 酒馆三人：一次调用生成三段（拉姆：/蕾姆：/艾米莉亚：）。
         注入族复用（现实/关怀/前情/日志/记忆库/场景/记忆宫），底稿=trio_prompt.txt 独立稿现读；
         脑跟总闸；小票/写回/审计同构。v4.3.5 serious_mode=OWI 滤镜认真标记。"""
@@ -3299,7 +3434,8 @@ class Handler(BaseHTTPRequestHandler):
         for _nm, blk in _recall_family(bare, (("往日日志", lambda: journal_block(bare)),
                                               ("记忆库", lambda: kb_memory_block(bare)),
                                               ("场景库", lambda: kb_scene_block(bare)),
-                                              ("记忆宫", lambda: palace_recall_block(bare, _vec_for(bare))),
+                                              ("记忆宫", (lambda: _deep_recall_block(bare)) if (deep_recall and not is_task)
+                                               else lambda: palace_recall_block(bare, _vec_for(bare))),
                                               ("想法账本", lambda: ideas_recall_block(bare)))):   # v4.4.5 用户结论复述提醒
             if blk:
                 sys_head += "\n\n" + blk
@@ -3345,6 +3481,9 @@ class Handler(BaseHTTPRequestHandler):
         if not is_task and IDEA_STORE_INTENT_RE.search(bare or ""):   # v4.4.6b 存档意图末位重申（D 案实锤：长回复丢末行指令）
             pmsg.append({"role": "system", "content": IDEA_STORE_REASSERT})
             _add_inj("存档重申", "意图命中")
+        if deep_recall and _DEEP_LAST.get("mode") == "empty":   # v4.5.0b 诚实空态末位重申（贴 user 压谄媚）
+            pmsg.append({"role": "system", "content": DEEP_EMPTY_REASSERT})
+            _add_inj("深忆空态重申", "命中")
         pmsg.append({"role": "user", "content": user_multimodal if (user_multimodal and B["glm"]) else bare})
         if want_stream:
             _exg = _GenFilter() if gen_hit_name else None
@@ -3597,6 +3736,16 @@ class Handler(BaseHTTPRequestHandler):
                 bare = bare[len("[裸测]"):].strip()
                 if not bare:
                     bare = "[空问题]"
+            # v4.5.0 深忆令牌：「深忆」前缀=手动加强召回（剥前缀后照常走脑分发，下游全用干净 bare；
+            # 「深忆：xxx」「深忆，xxx」带分隔符同吃。裸打「深忆」无内容=引导块（姐妹反问要翻哪段））
+            deep_recall = False
+            if bare.startswith(DEEP_TOKEN):
+                deep_recall = True
+                _DEEP_LAST["mode"] = "off"   # v4.5.0b 每轮深忆入口重置防上轮残态
+                _dc = bare[len(DEEP_TOKEN):].strip().lstrip("：:，,。、 ").strip()
+                if _dc:
+                    bare = _dc
+                print(f"[bridge] 深忆令牌命中: q={bare[:40]}", flush=True)
             # v3.5.3 单人线：OWI 自定义模型（ram/rem）的系统提示词=单人底稿，随第一条 system 送达
             inc_sys = next((m.get("content") for m in msgs if m.get("role") == "system"), "")
             if isinstance(inc_sys, list):
@@ -3625,7 +3774,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._bare_run(B, _bp, bare, user_multimodal, want_stream, brain_id)
                 return
             if brain_id == TRIO_BRAIN:
-                self._trio(user_multimodal, bare, want_stream, is_task, brain_id, serious_mode)
+                self._trio(user_multimodal, bare, want_stream, is_task, brain_id, serious_mode, deep_recall)
                 return
             if B.get("binding"):
                 B = scene_brain(B["binding"])   # v4.0.0 总入口：脑由场景绑定现定（glm/ds/local）
@@ -3643,7 +3792,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 # v4.1.5（todo-06l）：双人接力任何异常→全栈进桥日志，用户只见人话（裸 KeyError 禁上屏）
                 try:
-                    self._duet(user_multimodal, bare, want_stream, is_task, brain_id)
+                    self._duet(user_multimodal, bare, want_stream, is_task, brain_id, deep_recall)
                 except Exception as _duet_e:
                     import traceback as _tb
                     print("[bridge] 双人接力异常:\n" + _tb.format_exc(), flush=True)
@@ -3723,7 +3872,8 @@ class Handler(BaseHTTPRequestHandler):
             for _nm, blk in _recall_family(bare, (("往日日志", lambda: journal_block(bare)),
                                                   ("记忆库", None if solo else lambda: kb_memory_block(bare)),
                                                   ("场景库", None if solo else lambda: kb_scene_block(bare)),
-                                                  ("记忆宫", lambda: palace_recall_block(bare, _vec_for(bare))),
+                                                  ("记忆宫", (lambda: _deep_recall_block(bare)) if (deep_recall and not is_task)
+                                                   else lambda: palace_recall_block(bare, _vec_for(bare))),
                                                   ("想法账本", lambda: ideas_recall_block(bare)))):   # v4.4.5 用户结论复述提醒（单人反刍同样要翻旧账）
                 if blk:
                     sys_head += "\n\n" + blk
@@ -3825,6 +3975,9 @@ class Handler(BaseHTTPRequestHandler):
             if not is_task and IDEA_STORE_INTENT_RE.search(bare or ""):   # v4.4.6b 存档意图末位重申（D 案实锤：长回复丢末行指令）
                 pmsg.append({"role": "system", "content": IDEA_STORE_REASSERT})
                 _add_inj("存档重申", "意图命中")
+            if deep_recall and _DEEP_LAST.get("mode") == "empty":   # v4.5.0b 诚实空态末位重申（贴 user 压谄媚）
+                pmsg.append({"role": "system", "content": DEEP_EMPTY_REASSERT})
+                _add_inj("深忆空态重申", "命中")
             # v3.5.2：智谱脑带图透传（content 数组）；DS 脑（魔搭不支持图）维持拍平文本
             pmsg.append({"role": "user",
                          "content": user_multimodal if (user_multimodal and B["glm"]) else bare})
