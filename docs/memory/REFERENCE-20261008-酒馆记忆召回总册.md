@@ -2,6 +2,7 @@
 
 > **定位**：酒馆/桌宠/服务全记忆管线的唯一总册。改桥/改台/改管线 = **同一天更新本册版本锚行**（Docs-as-Code 家法，20261008 用户令立）。
 > **版本锚**：代码正本仓 = 云机 `/root/core/bridge`（旧路径 `/root/work/cloud-config` 为 symlink，git 解析到真身），commit **`bedf9ad`**（2026-10-08；fa72a9d=首提交 109 文件+钥匙误入已全史铲除，bedf9ad=+/palace/recall 课堂直通）。查当前版：`cd /root/work/cloud-config && git log --oneline -1`。
+> **1113 追记（桥 v4.5.2，云仓 `0a079b9`）**：前情提要（chat_summary）触发从 `n%20==0` 精确取模改**水位线 `n−上一段摘要 up_to ≥ 20`**——旧边沿触发被单边写回（空回复轮只写 user）翻奇偶后整代空转，st-live 现账本 171 条奇数 + chat_summary 0 点实锤（上代账本 200/220/240 三发正常=换嵌重建前偶态史）；up_to=摘要点 payload 既有字段零新状态，读侧注入零改动。另钉死：重启日志「第三绑定失败 Address already in use」=设计性自撞非故障——正典脚本 `BRIDGE_BIND=172.19.0.1` 使 bind1 已占 docker OWI 口，bind3 再绑同址必炸；ss 实证双口在岗，OWI 口由 bind1 服务，每次重启必现勿再排查。
 > **参数判卷**：本册数字全部实测校准过；冲突仲裁 = 本册 > 桥源码注释 > 旧 HANDOFF/OPS。
 
 ## 〇、管线全图（一屏版）

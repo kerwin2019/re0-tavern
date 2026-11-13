@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
 """
+v4.5.2（1113 晚·前情提要水位线触发，用户问「chat_summary 为什么是空的」实锤死角）：旧条件
+n%SE==0=精确边沿触发，检查那一刻 chat_memory 条数恰为 20 倍数才中；写回每轮 2 条但 assistant 侧
+带 if _cl 守卫（空回复轮只写 user 一边），一次单边写回即翻奇偶，此后每轮 +2 奇偶永续，奇数永远
+撞不上 SE 倍数 → chat_summary 现账本（171 条奇数）整代空转，40 条窗口外的近史真空。日志 3 发
+「第 200/220/240 轮触发」全是换嵌重建前上代账本的偶态正常史（1003 换嵌清账把奇偶账一并清没）。
+修=水位线：读最新摘要点自带 up_to 字段（payload 既有，零新状态），n−up_to ≥ SE 才压；读失败按
+0 算=最多多压一段不漏。自愈：重启后下一个正常对话轮即补出首段前情。读侧注入（latest_summary_full
+→【前情提要】system 顶部）零改动。
 v4.5.0（1113 午·深忆令牌，用户令「模糊查询召回不准，两个都做」之任务一）：消息前缀「深忆」=手动
 加强召回。链路=剥前缀（「深忆：xxx」「深忆，xxx」带分隔符同吃；裸打「深忆」无内容=引导块姐妹反问
 要翻哪段）→ _deep_condense()（GLM 5.3-flash low temperature 0.3 max_tokens 150，LangChain
@@ -1962,8 +1970,8 @@ def kb_memory_block(user):
 
 
 def maybe_summarize(session_id):
-    """每 SUMMARY_EVERY 轮：后台线程把上一段前情+近 20 轮浓缩成叙事梗概写 chat_summary。
-    GLM low 档后台跑，不占对话时延；失败静默（下个 20 轮再试）。"""
+    """每攒 SUMMARY_EVERY 条新消息（水位线 n−上一段 up_to）：后台线程把上一段前情+近 20 条浓缩成
+    叙事梗概写 chat_summary。GLM high 档后台跑（v4.0.0 针5），不占对话时延；失败静默（下轮水位再试）。"""
     def _job():
         try:
             c = httpx.post(f"{QDRANT}/collections/chat_memory/points/count", timeout=15,
@@ -1971,7 +1979,23 @@ def maybe_summarize(session_id):
                                {"key": "sessionId", "match": {"value": session_id}}]}})
             n = c.json()["result"]["count"]
             SE = int(_P("summary_every"))
-            if n == 0 or n % SE != 0:
+            # v4.5.2 水位线触发（治精确取模死角）：n−上一段摘要 up_to ≥ SE 才压，不看奇偶。
+            # 血案：旧条件 n%SE==0 是边沿触发——只有检查那一刻条数恰为 SE 倍数才中；而写回每轮 2 条
+            # 但 assistant 侧带 if _cl 守卫（空回复轮只写 user 一边），一次单边写回即翻奇偶，此后每轮
+            # +2 奇偶永续，奇数永远撞不上 SE 倍数 → chat_summary 整代账本空转（1113 实锤：st-live
+            # 171 条奇数 + 0 点；日志 3 发「第 200/220/240 轮触发」全是换嵌重建前上代账本的偶态正常史）。
+            up_to = 0
+            try:
+                r2 = httpx.post(f"{QDRANT}/collections/chat_summary/points/scroll", timeout=15,
+                                json={"limit": 100, "with_payload": True,
+                                      "filter": {"must": [{"key": "sessionId", "match": {"value": session_id}}]}})
+                for p in r2.json()["result"]["points"]:
+                    v = (p.get("payload") or {}).get("up_to")
+                    if isinstance(v, (int, float)) and v > up_to:
+                        up_to = int(v)
+            except Exception:
+                pass   # 水位线读不到按 0 算：最多多压一段，不会漏
+            if n == 0 or n - up_to < SE:
                 return
             prev = latest_summary()
             r = httpx.post(f"{QDRANT}/collections/chat_memory/points/scroll", timeout=15,
@@ -2006,7 +2030,7 @@ def maybe_summarize(session_id):
                       json={"points": [{"id": pid, "vector": [0, 0],
                             "payload": {"sessionId": session_id, "summary": text, "ts": pid,
                                         "source": "bridge-auto", "up_to": n}}]})
-            _log(f"前情提要已更新（第 {n} 轮触发，{len(text)} 字）")
+            _log(f"前情提要已更新（水位 {up_to}→{n} 条触发，{len(text)} 字）")
         except Exception as e:
             _log("摘要生成失败: " + str(e)[:150])
     threading.Thread(target=_job, daemon=True).start()
