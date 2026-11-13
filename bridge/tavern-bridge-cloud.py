@@ -1,5 +1,18 @@
 # -*- coding: utf-8 -*-
 """
+v4.5.4（1114 凌晨·联网搜索块清洗「剥块留句」，用户自由发散拍板 A 案全链动工）：OWI 0.11.4 联网
+搜索（1114 修复后生效：引擎博查欠费→tavily+function_calling native→legacy）把搜索结果按 RAG 模板
+（### Task 头+<context><source id=… resource-type="web_search">+User Query 段，实测 13187 字）拼进
+user 消息原文——桥裸收后三路泄漏：①13187 字整条进 chat_memory→每轮 40 条窗口重复背 token；②摘要/
+蒸馏原料被 wiki 污染（第三手转述进长期记忆风险）；③日记文案员原料混英文模板头。修=do_POST 入口
+strip_search_block()：三锚点（### Task:、<context>、resource-type="web_search"）≥2 命中才剥（防
+普通消息误伤），剥 <context>…</context> 整块+剥任务模板头，还原 User Query 段当真实问句，写回=
+「（联网查了一下：…）」指针句（姐妹短期记忆留"查过这事"可召回，不存 wiki 原文——业界共识=工具
+输出不进叙事记忆，Mem0 分流/Letta 分库）；**当轮发给模型的原文不动**（搜索有效性保住）。失配=
+原样存+日志 [search-strip] 大声记账（OWI 升级改模板措辞即失配——清洗器认的是提示词模板排版非
+协议字段，rag.template 后台可改同理）。小票加 web_search 元数据列（queries/sources/chars/query，
+全文不入票防撑爆日志）。三写回点接线：trio/duet 用 bare_ws、unified 用 user_ws；深忆/裸测/任务
+调用在清洗器之后=零感知。
 v4.5.3（1113 深夜·角色扮演浓度两旋钮，用户令「浓度不太高，做可调节拖条」经三轮讨论定案）：①rp_level
 演出浓度挡 1-4（管理台真步进滑条 min1 max4 step1 只停四格，用户点名禁假百分比）：1=轻度块（放松平实
 实用优先）/2=标准=现状零注入（默认，上线零变更）/3=加强块（第一人称入戏禁助手腔禁提及 AI/系统/提示词）
@@ -653,6 +666,56 @@ _PAID_1113 = {"ts": 0.0}   # v4.1.0 最近一次付费余额不足（1113）时�
 
 
 _EXPR_IMG_STRIP_RE = re.compile(r"!\[[^\]]*\]\(\s*/expr/[^)]*\)")   # v4.4.2 入库剥图：/expr/ 表情图 markdown 不进姐妹记忆（不限角色防新路径漏网；屏显/语音账本不受影响）
+
+
+# ==== v4.5.4 联网搜索块清洗（剥块留句）：OWI 把搜索结果按 RAG 模板拼进 user 消息，写回前剥块 ====
+# 三锚点≥2 才动手（防普通消息误伤）；失配=原样过+大声记账 [search-strip]（OWI 改模板措辞即失配）。
+_WS_ANCHOR_TASK = "### Task:"
+_WS_ANCHOR_CTX = "<context>"
+_WS_ANCHOR_TYPE = 'resource-type="web_search"'
+_WS_CTX_RE = re.compile(r"<context>.*?</context>", re.S)
+_WS_TASK_RE = re.compile(r"^### Task:.*?(?=\n### User Query:|\Z)", re.S)
+# User Query 段终点：下一个 ### 标题或 <context>（OWI 0.11.4 模板 User Query 在 context 前；1114 单测实锤）
+_WS_QUERY_RE = re.compile(r"### User Query:?\s*(.+?)(?=\n###|\n<context>|\Z)", re.S)
+
+
+def strip_search_block(t):
+    """v4.5.4：写回专用的搜索块清洗。返回 (干净文本, 元数据 dict|None)。
+    元数据={queries:[问句], sources:n, chars:剥除字数}；未命中=原样返回+None。绝不抛异常。"""
+    try:
+        t = t or ""
+        if len(t) < 400:   # 搜索块必带千字级 context，短消息零成本快退
+            return t, None
+        hits = sum(1 for a in (_WS_ANCHOR_TASK, _WS_ANCHOR_CTX, _WS_ANCHOR_TYPE) if a in t)
+        if hits < 2:
+            if hits == 1:
+                _log("[search-strip] 单锚点疑似未剥（OWI 模板可能改版）: " + t[:80].replace("\n", " "))
+            return t, None
+        out = t
+        q = ""
+        mq = _WS_QUERY_RE.search(out)
+        if mq:
+            q = mq.group(1).strip()[:120]
+        ctx_n = 0
+        m2 = _WS_CTX_RE.search(out)
+        if m2:
+            ctx_n = len(m2.group(0))
+            out = _WS_CTX_RE.sub("", out)
+        out = _WS_TASK_RE.sub("", out)
+        out = re.sub(r"^### User Query:?\s*", "", out, flags=re.M)   # v4.5.4b 剥残留标题行（1114 单测实锤）
+        out = re.sub(r"<source[^>]*>", "", out)
+        out = re.sub(r"</source>", "", out)
+        out = re.sub(r"\n{3,}", "\n\n", out).strip()
+        if q:
+            out = (out + ("\n" if out else "") + "（联网查了一下：" + q + "）").strip()
+        meta = {"queries": [q] if q else [], "sources": len(re.findall(r"<source", t)),
+                "chars": ctx_n, "query": q}
+        _log(f"[search-strip] 已剥 {ctx_n} 字搜索块，还原问句: {q[:40] or '?'}")
+        # v4.5.4b 空态回退修（单测实锤）：剥完为空且无问句 → 返回剥后空串，绝不退未剥原文（=泄漏）
+        return out, meta
+    except Exception as e:
+        _log("[search-strip] 清洗异常 fail-open 原样存: " + str(e)[:80])
+        return t, None
 
 
 def _clean_for_memory(t):
@@ -3310,7 +3373,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return "拉姆：" + ram_text + "\n\n蕾姆：" + rem_text
 
-    def _duet(self, user_multimodal, bare, want_stream, is_task, brain_id, deep_recall=False):
+    def _duet(self, user_multimodal, bare, want_stream, is_task, brain_id, deep_recall=False, mem_text=None, ws_meta=None):
         """v3.5.7 双人同台：拉姆先说→她的原话进上下文→雷姆真接。写回/审计一次。"""
         t0 = time.time()
         label = BRAINS[brain_id]["label"]
@@ -3447,7 +3510,7 @@ class Handler(BaseHTTPRequestHandler):
         _voice_ledger_put(combined)   # v4.4.0 语音锚点账本（流式/非流式全汇此，text 已终态）
         if not is_task:
             _base = int(time.time() * 1000)
-            mem_write("st-live", "user", bare, _base)
+            mem_write("st-live", "user", mem_text or bare, _base)
             _cl = _clean_for_memory(combined)
             if _cl:
                 mem_write("st-live", "assistant", _cl, _base + 1)
@@ -3465,7 +3528,8 @@ class Handler(BaseHTTPRequestHandler):
         _rxd = _rx()
         _t1 = _rxd.pop("t_first", None)   # v3.7.4 首字真值；ds 伪流/限额话=None
         _receipt_write({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "session": "st-live",
-                        "mode": brain_id, "provider": _prov, "user_text": bare[:500],
+                        "mode": brain_id, "provider": _prov, "user_text": (mem_text or bare)[:500],
+                        "web_search": ws_meta,
                         "injections": _rxd["inj"], "recalls": _rxd["recalls"],
                         "timings": {"first_token_ms": (round((_t1 - t0) * 1000) if _t1 else None),
                                     "total_ms": round((time.time() - t0) * 1000)},
@@ -3473,7 +3537,7 @@ class Handler(BaseHTTPRequestHandler):
                         "expr": {"tags": len(EXPR_TAG_RE.findall(combined))}, "error": None})   # v3.7.3 duet 小票（原缺）
         _log(f"{brain_id} 回复({round(time.time() - t0, 1)}s): {combined[:60]}")
 
-    def _trio(self, user_multimodal, bare, want_stream, is_task, brain_id, serious_mode=False, deep_recall=False):
+    def _trio(self, user_multimodal, bare, want_stream, is_task, brain_id, serious_mode=False, deep_recall=False, mem_text=None, ws_meta=None):
         """v3.7.0 酒馆三人：一次调用生成三段（拉姆：/蕾姆：/艾米莉亚：）。
         注入族复用（现实/关怀/前情/日志/记忆库/场景/记忆宫），底稿=trio_prompt.txt 独立稿现读；
         脑跟总闸；小票/写回/审计同构。v4.3.5 serious_mode=OWI 滤镜认真标记。"""
@@ -3662,7 +3726,7 @@ class Handler(BaseHTTPRequestHandler):
         _voice_ledger_put(text)   # v4.4.0 语音锚点账本（统一管线咽喉）
         if not is_task:
             _base = int(time.time() * 1000)
-            mem_write("st-live", "user", bare, _base)
+            mem_write("st-live", "user", mem_text or bare, _base)
             _cl = _clean_for_memory(text)
             if _cl:
                 mem_write("st-live", "assistant", _cl, _base + 1)
@@ -3678,7 +3742,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
         _t1 = _rx().pop("t_first", None)   # v3.7.4 首字真值；非流式/限额话=None
         _receipt_write({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "session": "st-live",
-                        "mode": brain_id, "provider": B.get("label", "?"), "user_text": bare[:500],
+                        "mode": brain_id, "provider": B.get("label", "?"), "user_text": (mem_text or bare)[:500],
+                        "web_search": ws_meta,
                         "injections": _rx()["inj"],   # v3.7.2 逐块接线（原硬编码单块截断 2000，收集了却没接进小票）
                         "recalls": _rx()["recalls"],
                         "timings": {"first_token_ms": (round((_t1 - t0) * 1000) if _t1 else None),
@@ -3840,6 +3905,10 @@ class Handler(BaseHTTPRequestHandler):
                 if _dc:
                     bare = _dc
                 print(f"[bridge] 深忆令牌命中: q={bare[:40]}", flush=True)
+            # v4.5.4 搜索块清洗（剥块留句）：写回用干净文本，当轮模型请求仍带原文（搜索有效性保住）。
+            # 在深忆/裸测剥离之后：深忆/裸测语义不受影响；任务调用（标题/标签生成）无需清洗（零写回）。
+            bare_ws, _ws_meta = strip_search_block(bare)
+            user_ws = strip_search_block(user)[0] if (user and user != bare) else bare_ws
             # v3.5.3 单人线：OWI 自定义模型（ram/rem）的系统提示词=单人底稿，随第一条 system 送达
             inc_sys = next((m.get("content") for m in msgs if m.get("role") == "system"), "")
             if isinstance(inc_sys, list):
@@ -3868,7 +3937,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._bare_run(B, _bp, bare, user_multimodal, want_stream, brain_id)
                 return
             if brain_id == TRIO_BRAIN:
-                self._trio(user_multimodal, bare, want_stream, is_task, brain_id, serious_mode, deep_recall)
+                self._trio(user_multimodal, bare, want_stream, is_task, brain_id, serious_mode, deep_recall, mem_text=bare_ws, ws_meta=_ws_meta)
                 return
             if B.get("binding"):
                 B = scene_brain(B["binding"])   # v4.0.0 总入口：脑由场景绑定现定（glm/ds/local）
@@ -3886,7 +3955,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 # v4.1.5（todo-06l）：双人接力任何异常→全栈进桥日志，用户只见人话（裸 KeyError 禁上屏）
                 try:
-                    self._duet(user_multimodal, bare, want_stream, is_task, brain_id, deep_recall)
+                    self._duet(user_multimodal, bare, want_stream, is_task, brain_id, deep_recall, mem_text=bare_ws, ws_meta=_ws_meta)
                 except Exception as _duet_e:
                     import traceback as _tb
                     print("[bridge] 双人接力异常:\n" + _tb.format_exc(), flush=True)
@@ -4168,7 +4237,7 @@ class Handler(BaseHTTPRequestHandler):
             # 写回区：chat_memory 双点 + 每 20 条摘要（v3.5.1 后台任务只答不记，审计照走）
             if not is_task:
                 _base = int(time.time() * 1000)
-                mem_write("st-live", "user", user, _base)
+                mem_write("st-live", "user", user_ws, _base)
                 _cl = _clean_for_memory(text)
                 if _cl:
                     mem_write("st-live", "assistant", _cl, _base + 1)
@@ -4187,7 +4256,8 @@ class Handler(BaseHTTPRequestHandler):
             _t1 = _rxd.pop("t_first", None)   # v3.7.4 首字真值；非流式/限额话=None
             _receipt_write({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "session": "st-live",
                             "mode": brain_id + ("·solo" if solo else "") + ("·task" if is_task else ""),
-                            "provider": B.get("label", "?"), "user_text": bare[:500],
+                            "provider": B.get("label", "?"), "user_text": bare_ws[:500],
+                            "web_search": ws_meta,
                             "injections": _rxd["inj"], "recalls": _rxd["recalls"],
                             "timings": {"recall_ms": round((_t_recall_done - _t_anchor) * 1000),
                                         "first_token_ms": (round((_t1 - t0) * 1000) if _t1 else None),
@@ -4204,7 +4274,8 @@ class Handler(BaseHTTPRequestHandler):
                 _receipt_write({"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "session": "st-live",
                                 "mode": str(locals().get("brain_id", "?")),
                                 "provider": str((locals().get("B") or {}).get("label", "?")),
-                                "user_text": str(locals().get("bare", ""))[:300],
+                                "user_text": str(locals().get("bare_ws", locals().get("bare", "")))[:300],
+                                "web_search": locals().get("_ws_meta"),
                                 "injections": [], "recalls": [], "timings": {}, "writes": {}, "expr": {},
                                 "error": str(e)[:300]})
             except Exception:
