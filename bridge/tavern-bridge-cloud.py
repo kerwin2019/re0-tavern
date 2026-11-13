@@ -1,5 +1,14 @@
 # -*- coding: utf-8 -*-
 """
+v4.5.3（1113 深夜·角色扮演浓度两旋钮，用户令「浓度不太高，做可调节拖条」经三轮讨论定案）：①rp_level
+演出浓度挡 1-4（管理台真步进滑条 min1 max4 step1 只停四格，用户点名禁假百分比）：1=轻度块（放松平实
+实用优先）/2=标准=现状零注入（默认，上线零变更）/3=加强块（第一人称入戏禁助手腔禁提及 AI/系统/提示词）
+/4=全沉浸块（真实生活感细节更密）+现实锚标签【现实世界】→【此刻】（日期天气数据保留只降标签出戏度
+——时间锚还喂关怀钩子不能删）。②kb_topk 台词/场景注入条数 1-10 独立数字框（默认 3=历史现状，与挡位
+脱钩——用户「5 条还是有点少」要自由填大）：三处硬编码 limit:3（solo 台词参考 L1642/双人库/场景库）换
+rp_inject_limit()。注入点=english_block 同三点位（duet/trio/统一线），守卫同款，_add_inj 记「演出
+浓度」进小票。热读=_P 每请求现读，拖完下一句生效；回滚=拖回 2/填 3 免重启。管理台 BP_SCHEMA+步进
+滑条渲染器同窗施工。
 v4.5.2（1113 晚·前情提要水位线触发，用户问「chat_summary 为什么是空的」实锤死角）：旧条件
 n%SE==0=精确边沿触发，检查那一刻 chat_memory 条数恰为 20 倍数才中；写回每轮 2 条但 assistant 侧
 带 if _cl 守卫（空回复轮只写 user 一边），一次单边写回即翻奇偶，此后每轮 +2 奇偶永续，奇数永远
@@ -620,7 +629,8 @@ def _receipt_write(rec):
 PARAMS_FILE = "/root/work/cloud-config/bridge_params.json"
 PARAMS_DEFAULT = {"bond_daily_cap": 3, "nostalgia_prob": 15, "nostalgia_half": 50,
                   "nostalgia_daily_max": 1, "vision_tail": 40, "summary_every": 20,
-                  "reply_temperature": 0.8, "recall_limit": 6, "english_mode": 0}
+                  "reply_temperature": 0.8, "recall_limit": 6, "english_mode": 0,
+                  "rp_level": 2, "kb_topk": 3}   # v4.5.3 演出浓度挡（2=标准零注入）/台词注入条数（3=现状）
 
 
 def _P(key):
@@ -1483,11 +1493,51 @@ def english_block():
         return ""
 
 
+# ==== v4.5.3 角色扮演浓度（rp_level 1-4 挡 + kb_topk 条数，管理台桥参数页热调）====
+# 挡位=真步进（管理台 range min1 max4 step1 只停四格）；2=标准=现状零注入（默认零行为变更）。
+# 4=全沉浸时 reality_block 标签【现实世界】→【此刻】（数据保留只降标签出戏度）。
+_RP_BLOCK_L1 = ("【演出浓度·轻度】以姐妹身份回应，但语气放松平实：实用问题（查事、办事）优先把"
+                "信息讲清楚，动作描写从简，不必强行加戏。")
+_RP_BLOCK_L3 = ("【演出浓度·加强】完全第一人称入戏：动作、神态与环境描写自然融进对话；语气与称呼"
+                "始终是姐妹对主人；禁止助手腔、禁止跳出角色解释、禁止提及 AI/系统/提示词。")
+_RP_BLOCK_L4 = ("【演出浓度·全沉浸】你就是她们本人，不是在扮演：把此刻当成真实发生的生活来过——"
+                "动作、神态、环境与情绪细节比平时更密，敢用语气词、停顿和小动作；全程第一人称，"
+                "绝不出现任何出戏痕迹（AI/模型/提示词/「作为…」一律禁止）；"
+                "现实信息（日期天气）只当自己本来就知道，不提来源。")
+
+
+def rp_block():
+    """演出浓度块：挡位→文本；2=标准返回空串（零注入）；任何异常 fail-open 空。"""
+    try:
+        lv = int(_P("rp_level"))
+    except Exception:
+        return ""
+    if lv <= 1:
+        return _RP_BLOCK_L1
+    if lv == 3:
+        return _RP_BLOCK_L3
+    if lv >= 4:
+        return _RP_BLOCK_L4
+    return ""
+
+
+def rp_inject_limit():
+    """台词库/场景库每轮注入条数（kb_topk 1-10，默认 3=历史现状）；fail-open 3。"""
+    try:
+        return max(1, min(10, int(_P("kb_topk"))))
+    except Exception:
+        return 3
+
+
 def reality_block():
     """【现实世界】YYYY-MM-DD HH:MM 周X · 节日（今+明天是X） · 今明天气（拿不到就略过该项）。
     v3.5.4：节日位加"明天是X节"、天气位从现况升级为今明两天预报（"明天降温/带伞"的料）。"""
     now = datetime.now(CN_TZ)
-    parts = [f"【现实世界】{now.strftime('%Y-%m-%d %H:%M')} {WEEK_CN[now.weekday()]}"]
+    try:
+        _rp_full = int(_P("rp_level")) >= 4   # v4.5.3 全沉浸：标签降出戏度，日期天气数据保留
+    except Exception:
+        _rp_full = False
+    parts = [f"{'【此刻】' if _rp_full else '【现实世界】'}{now.strftime('%Y-%m-%d %H:%M')} {WEEK_CN[now.weekday()]}"]
     hol = HOLIDAYS_2026.get(now.strftime("%m-%d"))
     if hol:
         parts.append(hol)
@@ -1639,7 +1689,7 @@ def lines_block(user_text, who_key):
         if not coll:
             return ""
         r = httpx.post(f"{QDRANT}/collections/{coll}/points/search", timeout=10, json={
-            "vector": _vec_for(user_text), "limit": 3, "score_threshold": 0.55, "with_payload": True,
+            "vector": _vec_for(user_text), "limit": rp_inject_limit(), "score_threshold": 0.55, "with_payload": True,   # v4.5.3 kb_topk
             "filter": {"must": [{"key": "who", "match": {"value": SOLO_LINES_WHO[who_key]}}]}})
         lines = []
         for h in (r.json().get("result") or []):
@@ -1952,7 +2002,7 @@ def kb_memory_block(user):
     检索失败/不命中返回空串（伪向量天然低分同走此路），对话绝不因它受影响。"""
     try:
         q = httpx.post(f"{QDRANT}/collections/dual_dialogues/points/query", timeout=15,
-                       json={"query": _vec_for(user), "limit": 3, "score_threshold": 0.55,
+                       json={"query": _vec_for(user), "limit": rp_inject_limit(), "score_threshold": 0.55,   # v4.5.3 kb_topk
                              "with_payload": True})
         pts = [p for p in (q.json().get("result", {}).get("points") or [])
                if ((p.get("payload") or {}).get("text") or "").strip()]
@@ -2273,7 +2323,7 @@ def kb_scene_block(user):
     """v3.5.0：场景库召回（remram_lines top3 ≥0.55）→ 原著台词参考块。失败静默空。"""
     try:
         q = httpx.post(f"{QDRANT}/collections/remram_lines/points/query", timeout=15,
-                       json={"query": _vec_for(user), "limit": 3, "score_threshold": 0.55,
+                       json={"query": _vec_for(user), "limit": rp_inject_limit(), "score_threshold": 0.55,   # v4.5.3 kb_topk
                              "with_payload": True})
         pts = [p for p in (q.json().get("result", {}).get("points") or [])
                if ((p.get("payload") or {}).get("text") or "").strip()]
@@ -3286,6 +3336,10 @@ class Handler(BaseHTTPRequestHandler):
         if _enb:
             sys_head += "\n\n" + _enb
             _add_inj("英语模式", _enb)
+        _rpb = rp_block()   # v4.5.3 演出浓度（热读挡位，标准=空）
+        if _rpb:
+            sys_head += "\n\n" + _rpb
+            _add_inj("演出浓度", _rpb)
         chk_note = ""
         if not is_task:
             chk = checkin_directive()
@@ -3451,6 +3505,10 @@ class Handler(BaseHTTPRequestHandler):
         if _enb:
             sys_head += "\n\n" + _enb
             _add_inj("英语模式", _enb)
+        _rpb = rp_block()   # v4.5.3 演出浓度（热读挡位，标准=空）
+        if _rpb:
+            sys_head += "\n\n" + _rpb
+            _add_inj("演出浓度", _rpb)
         chk_note = ""
         if not is_task:
             chk = checkin_directive()
@@ -3883,6 +3941,10 @@ class Handler(BaseHTTPRequestHandler):
             if _enb:
                 sys_head += "\n\n" + _enb
                 _add_inj("英语模式", _enb)
+            _rpb = rp_block()   # v4.5.3 演出浓度（热读挡位，标准=空）
+            if _rpb:
+                sys_head += "\n\n" + _rpb
+                _add_inj("演出浓度", _rpb)
             chk_note = ""
             # v3.5.5 关怀钩子+单人指令：关怀挂双人/单人两线（任务调用跳过）；solo 指令只 solo 挂
             if not is_task:

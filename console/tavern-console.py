@@ -832,7 +832,7 @@ def _tokens_list():
 BP_FILE = "/root/work/cloud-config/bridge_params.json"
 BP_DEFAULT = {"bond_daily_cap": 3, "nostalgia_prob": 15, "nostalgia_half": 50,
               "nostalgia_daily_max": 1, "vision_tail": 40, "summary_every": 20,
-              "reply_temperature": 0.8}
+              "reply_temperature": 0.8, "rp_level": 2, "kb_topk": 3}
 BOND_FILE = "/root/work/cloud-config/bond_state.json"
 BP_SCHEMA = {  # key: (min, max, 类型, 说明)
     "bond_score":          (0, 100, int, "好感度当前分（0-100；≥70 恋人 / ≥50 亲密 / ≥90 灵魂伴侣）"),
@@ -843,6 +843,8 @@ BP_SCHEMA = {  # key: (min, max, 类型, 说明)
     "vision_tail":         (10, 80, int, "对话视野条数（40 条=20 轮；越大记得越远但更贵更慢）"),
     "summary_every":       (10, 50, int, "前情提要浓缩周期（每 N 条消息浓缩一次）"),
     "reply_temperature":   (0.1, 1.5, float, "回复温度（低=稳重 高=放飞）"),
+    "rp_level":            (1, 4, int, "演出浓度挡：1 轻度 2 标准 3 加强 4 全沉浸（2=现状零注入；4=现实锚标签换【此刻】）"),
+    "kb_topk":             (1, 10, int, "台词库/场景库每轮注入条数（默认 3=历史现状；越大台词味越足但每轮更长）"),
 }
 
 
@@ -2890,16 +2892,25 @@ bpLoad();
 async function bpLoad(){
   const d = await fetch('/api/bparams/get', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'}).then(r=>r.json());
   const box = document.getElementById('bp-cards');
-  box.innerHTML = Object.entries(d).map(([k, v]) => `
-   <div class="card mb-2"><div class="card-body py-2">
-    <div class="d-flex justify-content-between"><b style="font-size:13px">${esc(v.desc)}</b>
-    <span class="text-muted" style="font-size:12px">现值 <code>${v.value}</code>（默认 ${v.default}）</span></div>
+  box.innerHTML = Object.entries(d).map(([k, v]) => {
+   const LV = ['轻度','标准','加强','全沉浸'];
+   const ctrl = (k === 'rp_level') ? `
+    <input type="range" min="1" max="4" step="1" value="${v.value}" id="bp-in-${k}" class="form-range mt-1" style="max-width:300px"
+     oninput="document.getElementById('bp-lv-${k}').textContent=['轻度','标准','加强','全沉浸'][this.value-1]">
+    <div class="d-flex justify-content-between text-muted" style="max-width:300px;font-size:11px"><span>轻度</span><span>标准</span><span>加强</span><span>全沉浸</span></div>
+    <div class="mt-1"><span id="bp-lv-${k}" class="badge bg-primary">${LV[v.value-1]||'?'}</span>
+     <button class="btn btn-primary btn-sm ms-2" onclick="bpSave('${k}')">保存</button></div>` : `
     <div class="input-group input-group-sm mt-1">
      <input type="number" step="0.1" id="bp-in-${k}" class="form-control" placeholder="${v.min} ~ ${v.max}">
      <button class="btn btn-primary" onclick="bpSave('${k}')">保存</button>
-    </div>
+    </div>`;
+   return `
+   <div class="card mb-2"><div class="card-body py-2">
+    <div class="d-flex justify-content-between"><b style="font-size:13px">${esc(v.desc)}</b>
+    <span class="text-muted" style="font-size:12px">现值 <code>${v.value}</code>（默认 ${v.default}）</span></div>
+    ${ctrl}
     <div id="bp-out-${k}" class="text-muted mt-1" style="font-size:12px"></div>
-   </div></div>`).join('');
+   </div></div>`;}).join('');
   // v2.1.0 好感度当前分上屏（用户令：调参控件旁必须显示当前值——bp-score-now 占位此前从没被喂过）
   try{
     const a = await fetch('/api/affection', {method:'POST'}).then(r=>r.json());
