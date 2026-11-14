@@ -1657,6 +1657,9 @@ EXPR_EMOTIONS = ("admiration amusement anger annoyance approval caring confusion
                  "disappointment disapproval disgust embarrassment excitement fear gratitude grief joy "
                  "love nervousness neutral optimism pride realization relief remorse sadness surprise").split()
 EXPR_TAG_RE = re.compile(r"(?:!\[|\[\[)\s*(拉姆|蕾姆|雷姆|艾米莉亚)?\s*表情\s*[:：]\s*([a-zA-Z_]+?)\s*(?:\]\]|\])")
+# v4.5.4c 严格版（带主语才认）：fallback 判据专用——残缺标签（[[表情:xxx]] 无主语）会命中上面的宽松版
+# 却在 substitute 里因无主语只剥不插=既没图又骗过兜底（1114 实测三发 0 图实锤），fallback 改用本版判
+EXPR_TAG_STRICT_RE = re.compile(r"\[\[(拉姆|蕾姆|雷姆|艾米莉亚)\s*表情\s*[:：]\s*([a-zA-Z_]+?)\s*\]\]")
 # v4.4.1 字面图形态（模型抄历史 markdown 本尊，非标签——1022 六图案定谳）：/expr/ 路径图，多人场同角色首图定档
 EXPR_IMG_RE = re.compile(r"!\[[^\]]*\]\(\s*/expr/(ram|rem|emt)/[^)]*\)")
 # v4.3.4 收突变形：模型被历史里的 ![名 情绪](/expr/...) 图带跑，写出 ![拉姆表情:disapproval]
@@ -1676,7 +1679,12 @@ EXPR_RULE = ("【表情规则（系统级）】每个实际说话的角色说完
              "拉姆：（动作）台词……[[拉姆表情:disapproval]]\n"
              "蕾姆：（动作）台词……[[蕾姆表情:caring]]\n"
              "艾米莉亚：（动作）台词……[[艾米莉亚表情:curiosity]]——最后一个标签落下全文即结束，其后再无任何内容。"
-             "严禁把标签写成图片形式（如 ![拉姆表情:xxx] 单层方括号带叹号）——那不是标签是残缺图，必须双方括号。")
+             "严禁把标签写成图片形式（如 ![拉姆表情:xxx] 单层方括号带叹号）——那不是标签是残缺图，必须双方括号。"
+             "（v4.5.4c 新增禁令）情绪名只准出现在双方括号标签体内，且标签里必须写实名："
+             "严禁把情绪写成裸文本——「拉姆 disapproval」「拉姆 neutral 蕾姆 neutral」这种角色名+英文单词连排=格式违规，"
+             "系统将收不到任何表情（本形 1114 实测出现，导致整轮只出兜底单图）；也严禁无主语的残缺标签"
+             "（如双方括号里只有「表情」二字不带拉姆/蕾姆/艾米莉亚实名=系统同样收不到）。"
+             "三人场正确示范（照抄此形，把情绪词换掉即可）：[[拉姆表情:anger]] [[蕾姆表情:caring]] [[艾米莉亚表情:curiosity]]。")
 
 # v4.3.5 认真模式（OWI 滤镜打标 → 桥装配；用户规格 1020 晚原话要点）：块置底=紧贴 user 生成位。
 SERIOUS_MARKER = "[[SERIOUS_MODE]]"
@@ -1708,12 +1716,18 @@ EXPR_REASSERT = ("【表情输出·硬性重申】每个实际说了话的角色
                  "除此之外不输出任何其他标签或链接。"
                  "【输出终点契约】最后一个表情标签=全文的最后一个字：标签落下立即收笔，后面什么都没有。"
                  "禁止任何形式的结尾标签汇总、重述或收尾行（no tag restatement at the end; no summary tag "
-                 "block after the final paragraph; end immediately after the last [[表情:...]] tag）。")
+                 "block after the final paragraph; end immediately after the last [[表情:...]] tag）。"
+                 "情绪名禁写成裸文本（「拉姆 disapproval」式角色名+英文单词连排=违规，系统收不到表情，"
+                 "整轮只剩兜底单图——1114 实测）；也禁无主语残缺标签（双括号里不写拉姆/蕾姆/艾米莉亚实名"
+                 "=同样收不到，1114 三发 0 图实锤）。情绪只准住在带实名的双方括号标签里，"
+                 "如 [[拉姆表情:anger]]。")
 
 
 def expr_fallback_tail(text, default_who):
-    """无标签时的兜底图：单人=该角色 neutral；双人线=按文中实际出场的姐妹各补一张 neutral。"""
-    if EXPR_TAG_RE.search(text or ""):
+    """无标签时的兜底图：单人=该角色 neutral；双人线=按文中实际出场的姐妹各补一张 neutral。
+    v4.5.4c 判据改严格版（带主语）：残缺标签（[[表情:xxx]] 无主语）会命中宽松版却在 substitute
+    里被剥不换图=既没图又骗过兜底（1114 三发 0 图实锤）。"""
+    if EXPR_TAG_STRICT_RE.search(text or ""):
         return ""
     if default_who:
         return expr_img(default_who, "neutral")
@@ -1788,9 +1802,53 @@ def expr_img(who, emo):
     return f"\n\n![{label} {emo}](/expr/{who}/{emo}.png)"
 
 
+# v4.5.4c 表情漂移修复器（1114 实锤案：模型把情绪写成「拉姆 disapproval 蕾姆 neutral」式裸文本链
+# →0 合法标签→兜底单图；且漂移样例进 chat_memory 被 40 条窗口回抄=自我强化）。业界对表（1114 联网搜）：
+# 纯提示词控格式不可靠（arXiv 2606 结构化输出研究），ST 官方表情扩展干脆不用 LLM 打标签（本地分类器）；
+# 咱取 validation-repair 模式=裸链里 role→emotion 映射是现成的，确定性改写成正规双方括号标签喂现有
+# 换图管线。只动链（≥2 对，或对后紧跟另一对/角色名：对话）；英文情绪词嵌中文行文（nervousness 地式）
+# 单对不动=交兜底，防误伤。指令面禁令（EXPR_RULE/REASSERT 裸词违规行）同批已上=双保险。
+_WS28 = "admiration|amusement|anger|annoyance|approval|caring|confusion|curiosity|desire|disappointment|disapproval|disgust|embarrassment|excitement|fear|gratitude|grief|joy|love|nervousness|neutral|optimism|pride|realization|relief|remorse|sadness|surprise"
+_EXPR_PAIR_RE = re.compile(r"(拉姆|蕾姆|艾米莉亚)[ \t]+(" + _WS28 + r")\b")
+_EXPR_CHAIN_RE = re.compile(
+    r"(?:拉姆|蕾姆|艾米莉亚)[ \t]+(?:" + _WS28 + r")\b(?:[ \t]*[,、，]?[ \t]*(?:拉姆|蕾姆|艾米莉亚)[ \t]+(?:" + _WS28 + r")\b)+")
+# 链尾孤儿对：正规标签后紧跟的单对（链被流式 chunk 切断时，尾对掉队）——挂链转正后补收
+_EXPR_ORPHAN_RE = re.compile(
+    r"(\[\[[^\]]*表情[^\]]*\]\])[ \t]*[,、，]?[ \t]*(拉姆|蕾姆|艾米莉亚)[ \t]+(" + _WS28 + r")\b")
+# 单对+下一角色对话（实测形态 14:24「拉姆 disapproval 蕾姆：（在旁边听着」）：对后紧跟别角色名+冒号=认定漂移
+_EXPR_PRECOLON_RE = re.compile(
+    r"(拉姆|蕾姆|艾米莉亚)[ \t]+(" + _WS28 + r")\b[ \t]*(?=(?:拉姆|蕾姆|艾米莉亚)：)")
+
+
+def _expr_repair_drift(text):
+    """v4.5.4c：裸情绪词链→正规标签（喂 expr_substitute 原管线）。非链不动，绝不抛异常。
+    孤儿对（标签后掉队单对）、对话前单对一并收编；循环到不再变化。"""
+    try:
+        if not text or len(text) < 40:
+            return text or ""
+        def _mk(m):
+            pairs = _EXPR_PAIR_RE.findall(m.group(0))
+            return " " + " ".join(f"[[{r}表情:{e}]]" for r, e in pairs) + " "
+        def _mk_tag(m):
+            return "[[" + m.group(1) + "表情:" + m.group(2) + "]]"
+        def _mk_orphan(m):
+            return m.group(1) + " [[" + m.group(2) + "表情:" + m.group(3) + "]]"
+        for _ in range(5):   # 链/孤儿互相触发，收敛上限防循环
+            new = _EXPR_CHAIN_RE.sub(_mk, text)
+            new = _EXPR_PRECOLON_RE.sub(_mk_tag, new)
+            new = _EXPR_ORPHAN_RE.sub(_mk_orphan, new)
+            if new == text:
+                break
+            text = new
+        return text
+    except Exception:
+        return text
+
+
 def expr_substitute(text, default_who=None):
     """表情标签→markdown 图（原位替换）；无主语标签用 default_who 兜底，再无则只剥不插。
-    v4.3.0 多人场（default_who=None）同人首图定档：后续同角色标签只剥不插（双写病，见头部账）。"""
+    v4.3.0 多人场（default_who=None）同人首图定档：后续同角色标签只剥不插（双写病，见头部账）。
+    v4.5.4c 漂移修复并入主链（repair→字面图收编→标签换图，见尾行注释）。"""
     seen = set()
 
     def _sub(m):
@@ -1809,14 +1867,21 @@ def expr_substitute(text, default_who=None):
                 return ""
             seen.add(w)
         return m.group(0)
-    out = EXPR_IMG_RE.sub(_img_sub, EXPR_TAG_RE.sub(_sub, text))   # v4.4.1 字面图同册去重（先标签后图片，共用 seen）
-    return out
+    # v4.5.4c 顺序对调修自剥案（1114 实锤）：旧序=标签先插图(seen.add)→IMG_RE 再扫全文→把刚插的图
+    # 当字面图剥掉（非流式/relay 尾路径潜伏 4 天，流式 filter 直插不受影响故未暴露）。新序=先收编
+    # 原文自带字面图（入 seen），再换标签（产出即返回，不再二次扫）；同角色首图定档语义不变。
+    text = EXPR_IMG_RE.sub(_img_sub, _expr_repair_drift(text or ""))
+    return EXPR_TAG_RE.sub(_sub, text)
 
 
 def expr_finish(text, default_who):
-    """非流式/写回收口：标签换图；一个标签都没有→补 neutral 兜底（default_who 为空则不兜底）。"""
+    """非流式/写回收口：标签换图；一个标签都没有→补 neutral 兜底（default_who 为空则不兜底）。
+    v4.5.4c 加 [expr-finish] 一行日志（who/标签原文/出图有无）=兜底链排障探针。"""
     out = expr_substitute(text or "", default_who)
     out += expr_fallback_tail(text or "", default_who)
+    _mt = EXPR_TAG_STRICT_RE.search(text or "")
+    _log(f"[expr-finish] who={default_who} tag={_mt.group(0) if _mt else None} "
+         f"pos={_mt.start() if _mt else -1}/{len(text or '')} out_img={'/expr/' in out} len={len(text or '')}")
     return out
 
 
@@ -1832,6 +1897,9 @@ class _ExprFilter:
     def feed(self, piece):
         self.buf += piece
         out = []
+        # v4.5.4c 漂移链修复（流式预步）：buf 里出现完整链→转正规标签交下方标签机制换图。
+        # 尾部半对（角色名已到情绪词未到）不被链匹配=留在 buf 等下块；孤儿对由 _EXPR_ORPHAN_RE 收编。
+        self.buf = _expr_repair_drift(self.buf) if len(self.buf) > 40 else self.buf
         while True:
             m = EXPR_TAG_RE.search(self.buf)
             m2 = EXPR_IMG_RE.search(self.buf)
