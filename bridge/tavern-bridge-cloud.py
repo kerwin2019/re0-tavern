@@ -1478,7 +1478,7 @@ def _bond_summary(st):
     except Exception:
         days = None
     if days:
-        parts.append(f"你与主人君相识已是第 {days} 天")
+        parts.append(f"你与主人相识已是第 {days} 天")
     score = st.get("score", 75)
     parts.append(f"当前关系：恋人 · 羁绊热度 {score}/100（{_bond_level(score)}）")
     recent = sum(h.get("delta", 0) for h in (st.get("hist") or [])[-5:])
@@ -4181,7 +4181,7 @@ class Handler(BaseHTTPRequestHandler):
                     _add_inj("回忆杀", _n_txt)
                 if _exam:
                     _e_txt = (f"【考你一题】（你从学习账本里翻出 {_exam.get('date', '')} 记下的一张知识点卡，"
-                              f"突然想考考主人君还记不记得。用你的口吻把下面的知识点变成一道问题抛给他，"
+                              f"突然想考考主人还记不记得。用你的口吻把下面的知识点变成一道问题抛给他，"
                               f"不要先说答案，等他答完你再点评。禁止提「账本/文件/记录/知识点卡」这类字眼。）\n"
                               f"知识点：{(_exam.get('text') or '')[:280]}")
                     sys_head += "\n\n" + _e_txt
